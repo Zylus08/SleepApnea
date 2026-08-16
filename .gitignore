@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch / Machine Learning
+*.pth
+*.pt
+*.ckpt
+
+# Datasets / Large Data Files (Strictly ignoring EDFs and processed tensors)
+*.edf
+*.tsv
+*.json
+*.nii.gz
+/SleepApneaDummy/
+/SleepApneaProcessed/
+/SleepApnea/
+
+# Virtual Environments
+venv/
+env/
+.env
+.venv/
+
+# IDEs
+.vscode/
+.idea/

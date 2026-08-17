@@ -22,6 +22,11 @@ venv/
 env/
 .env
 .venv/
+env312/
+
+pip_cache/
+pip312
+pip312.exe
 
 # IDEs
 .vscode/

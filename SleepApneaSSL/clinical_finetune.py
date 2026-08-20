@@ -61,7 +61,12 @@ class SubjectSplitDataset(Dataset):
         data = tensor_data[:, start:end].clone()
         
         data = (data - data.mean(dim=1, keepdim=True)) / (data.std(dim=1, keepdim=True) + 1e-6)
-        return data.contiguous(), torch.tensor(label, dtype=torch.long)
+        
+        # Convert subject string to a unique integer ID for tensor math
+        sub_idx = int(sub) 
+        time_idx = start // self.samples_per_window
+        
+        return data.contiguous(), torch.tensor(label, dtype=torch.long), torch.tensor(sub_idx, dtype=torch.long), torch.tensor(time_idx, dtype=torch.long)
 
 class ClinicalClassifier(nn.Module):
     def __init__(self, encoder, num_classes=2):
@@ -128,7 +133,7 @@ def finetune_and_evaluate():
     # Pass the real labels into the datasets
     train_dataset = SubjectSplitDataset('E:/SleepApneaProcessed', train_subs, label_dict)
     test_dataset = SubjectSplitDataset('E:/SleepApneaProcessed', test_subs, label_dict)
-    
+
     # shuffle=False is strictly required here to prevent the black-screen IO crash
     train_loader = DataLoader(train_dataset, batch_size=4, shuffle=False, drop_last=True, num_workers=0)
     test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, drop_last=False, num_workers=0)
@@ -153,7 +158,7 @@ def finetune_and_evaluate():
         model.train()
         total_loss, correct, total = 0, 0, 0
         
-        for batch_idx, (data, labels) in enumerate(train_loader):
+        for batch_idx, (data, labels, _, _) in enumerate(train_loader):
             data, labels = data.to(device), labels.to(device)
             optimizer.zero_grad()
             
@@ -190,7 +195,7 @@ def finetune_and_evaluate():
     all_labels = []
     
     with torch.no_grad():
-        for data, labels in test_loader:
+        for data, labels, _, _ in test_loader:
             data, labels = data.to(device), labels.to(device)
             
             # Use AMP for inference too

@@ -41,7 +41,7 @@ class TemporalNTXentLoss(nn.Module):
         
         # Ensure self-similarity is masked out (diagonal)
         mask = torch.eye(2 * batch_size, dtype=torch.bool, device=device)
-        sim_matrix.masked_fill_(mask, -9e15)
+        sim_matrix.masked_fill_(mask, -1e4)
         
         # Standard positive targets (z_i paired with z_j)
         pos_mask = torch.zeros((2 * batch_size, 2 * batch_size), dtype=torch.bool, device=device)

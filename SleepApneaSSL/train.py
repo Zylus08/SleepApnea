@@ -1,87 +1,111 @@
 import os
 import torch
-import torch.nn.functional as F
+import torch.optim as optim
 from torch.utils.data import DataLoader
-from dataset import SleepApneaSSLDataset
-from augmentations import EEGContrastiveTransform
-from model import EEGEncoder, SimCLR
+from torch.amp import autocast, GradScaler
+import time
+# Import your components
+from clinical_finetune import SubjectSplitDataset # Ensure this yields (data, label, sub_idx, time_idx)
+from model import EEGEncoder
+from augmentations import ICLRTimeTransform
+from temporal_loss import TemporalNTXentLoss
 
-def info_nce_loss(proj1, proj2, temperature=0.1):
-    proj1 = F.normalize(proj1, dim=-1)
-    proj2 = F.normalize(proj2, dim=-1)
-    
-    batch_size = proj1.shape[0]
-    out = torch.cat([proj1, proj2], dim=0)
-    sim_matrix = torch.exp(torch.mm(out, out.t().contiguous()) / temperature)
-    
-    mask = (~torch.eye(2 * batch_size, device=sim_matrix.device, dtype=torch.bool)).float()
-    sim_matrix = sim_matrix * mask
-    
-    positives = torch.exp(torch.sum(proj1 * proj2, dim=-1) / temperature)
-    positives = torch.cat([positives, positives], dim=0)
-    
-    loss = -torch.log(positives / sim_matrix.sum(dim=-1))
-    return loss.mean()
-
-def train():
-    print("[1/5] Initializing device...")
+def train_ssl():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    torch.cuda.empty_cache()
     print(f"Using device: {device}")
+    torch.cuda.empty_cache()
 
-    print("[2/5] Loading dataset & locking files...")
-    transform = EEGContrastiveTransform()
+    # 1. Hyperparameters
+    batch_size = 64
+    epochs = 20
+    lr = 3e-4
     
-    # Auto-grab the first 40 successfully processed subjects (~9.5 GB of RAM)
-    import os
-    all_processed = [f.split('_')[0].replace('sub-', '') for f in os.listdir('E:/SleepApneaProcessed') if f.endswith('.pt')]
-    subset_subjects = all_processed[:40]
+    # 2. Setup Dataset with Augmentations
+    processed_dir = 'E:/SleepApneaProcessed'
+    all_processed = [f.split('_')[0].replace('sub-', '') for f in os.listdir(processed_dir) if f.endswith('.pt')]
     
-    dataset = SleepApneaSSLDataset(
-        processed_root='E:/SleepApneaProcessed', 
-        subjects=subset_subjects, 
-        transform=transform
-    )
+    # Use all available subjects for self-supervised pre-training (no labels needed!)
+    print(f"Found {len(all_processed)} subjects for self-supervised pre-training.")
     
-    print("[3/5] Building DataLoader...")
-    # Keep batch_size=8 for the 4GB GPU constraint
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=True, drop_last=True, num_workers=0, pin_memory=False)
-    print("[4/5] Initializing model on GPU...")
-    encoder = EEGEncoder(in_channels=20)
-    model = SimCLR(encoder).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+    # Dummy label dict since SSL doesn't use clinical labels
+    dummy_labels = {s: 0 for s in all_processed}
+    
+    dataset = SubjectSplitDataset(processed_dir, all_processed, dummy_labels, transform=None)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0, drop_last=True)
+    
+    # 3. Initialize Model, Loss, and Optimizer
+    encoder = EEGEncoder(in_channels=20).to(device)
+    
+    # Projection head mapping encoder output to contrastive latent space (e.g., 128-dim)
+    projection_head = torch.nn.Sequential(
+        torch.nn.Linear(128, 128), # Adjust input dim based on your model.py final encoder output
+        torch.nn.ReLU(),
+        torch.nn.Linear(128, 64)
+    ).to(device)
+    
+    optimizer = optim.AdamW(list(encoder.parameters()) + list(projection_head.parameters()), lr=lr, weight_decay=1e-4)
+    criterion = TemporalNTXentLoss(temperature=0.5, lambda_decay=0.05)
+    scaler = GradScaler('cuda')
+    augmenter = ICLRTimeTransform()
 
-    print("[5/5] Launching Training Loop!")
-    epochs = 100
+    print("\n--- STARTING ICLR-GRADE TEMPORAL SSL PRE-TRAINING ---")
+    
     for epoch in range(epochs):
-        model.train()
-        total_loss = 0
+        encoder.train()
+        projection_head.train()
+        total_loss = 0.0
+        epoch_start_time = time.time()
         
-        for batch_idx, batch in enumerate(dataloader):
-            try:
-                view1, view2 = batch
-                view1, view2 = view1.to(device), view2.to(device)
-                
-                optimizer.zero_grad()
-                
-                _, proj1 = model(view1)
-                _, proj2 = model(view2)
-                
-                loss = info_nce_loss(proj1, proj2)
-                loss.backward()
-                optimizer.step()
-                
-                total_loss += loss.item()
-                
-            except Exception as e:
-                print(f"\n❌ CRASH AT EPOCH {epoch+1}, BATCH {batch_idx}: {e}")
-                import sys
-                sys.exit(1)
-                
-        print(f"Epoch {epoch+1}/{epochs} | Loss: {total_loss/len(dataloader):.4f}")
+        for batch_idx, (data, _, sub_ids, time_idxs) in enumerate(dataloader):
+            # 1. Move raw batch to GPU immediately
+            data = data.to(device)
+            sub_ids = sub_ids.to(device)
+            time_idxs = time_idxs.to(device)
 
-    torch.save(model.encoder.state_dict(), 'E:/SleepApnea/SleepApneaSSL/simclr_encoder.pth')
-    print("Pre-training complete. Encoder weights saved.") 
+            # 2. Apply complex FFTs and masking instantly on the GPU
+            view1, view2 = augmenter(data)
+
+            optimizer.zero_grad()
+
+            with autocast('cuda'):
+                # Forward pass through encoder and projection head
+                h1 = encoder(view1)
+                h2 = encoder(view2)
+                
+                z1 = projection_head(h1)
+                z2 = projection_head(h2)
+
+                # Compute Novel Temporal Contrastive Loss
+                loss = criterion(z1, z2, sub_ids, time_idxs)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            total_loss += loss.item()
+
+            if batch_idx % 50 == 0:
+                # Calculate elapsed time and speed
+                elapsed_time = time.time() - epoch_start_time
+                batches_completed = batch_idx + 1
+                batches_remaining = len(dataloader) - batches_completed
+                
+                # Predict remaining time
+                time_per_batch = elapsed_time / batches_completed
+                eta_seconds = batches_remaining * time_per_batch
+                
+                # Format into HH:MM:SS
+                eta_string = time.strftime('%H:%M:%S', time.gmtime(eta_seconds))
+                
+                print(f"Epoch [{epoch+1}/{epochs}] | Batch [{batch_idx}/{len(dataloader)}] | Loss: {loss.item():.4f} | Batch Time: {time_per_batch:.3f}s | ETA: {eta_string}")
+
+        avg_loss = total_loss / len(dataloader)
+        print(f"==> Epoch {epoch+1} Complete | Average Loss: {avg_loss:.4f}\n")
+
+    # Save the pre-trained weights
+    save_path = 'E:/SleepApnea/SleepApneaSSL/iclr_pretrained_encoder.pth'
+    torch.save(encoder.state_dict(), save_path)
+    print(f"Pre-trained ICLR encoder saved successfully to {save_path}")
 
 if __name__ == '__main__':
-    train()
+    train_ssl()

@@ -53,7 +53,7 @@ def evaluate_and_tune():
 
     print("Running inference on Test Set...")
     with torch.no_grad():
-        for data, labels in test_loader:
+        for data, labels, _, _ in test_loader:
             data, labels = data.to(device), labels.to(device)
             with autocast('cuda'):
                 outputs = model(data)

@@ -11,14 +11,13 @@ import gc
 import pandas as pd
 from model import EEGEncoder
 
-@lru_cache(maxsize=4)
-def load_cached_subject(pt_path):
-    return torch.load(pt_path, weights_only=True)
-
 class SubjectSplitDataset(Dataset):
-    def __init__(self, processed_root, subjects, label_dict, window_size_sec=30, sfreq=100): # <-- Added label_dict
+    def __init__(self, processed_root, subjects, label_dict, transform=None): # <-- Added label_dict
         self.processed_root = processed_root
-        self.samples_per_window = int(window_size_sec * sfreq)
+        self.subjects = subjects
+        self.label_dict = label_dict
+        self.transform = transform
+        self.samples_per_window = 3000
         self.windows = []
         
         print(f"Scanning {len(subjects)} subjects (Sequential I/O Mode)...")
@@ -47,7 +46,7 @@ class SubjectSplitDataset(Dataset):
                 
             except Exception:
                 pass
-                
+        
         print(f"Total windows ready: {len(self.windows)}")
 
     def __len__(self):
@@ -57,8 +56,9 @@ class SubjectSplitDataset(Dataset):
         sub, start, end, label = self.windows[idx]
         pt_path = os.path.join(self.processed_root, f'sub-{sub}_eeg.pt')
         
-        tensor_data = load_cached_subject(pt_path)
+        tensor_data = torch.load(pt_path, weights_only=True, mmap=True)
         data = tensor_data[:, start:end].clone()
+        del tensor_data
         
         data = (data - data.mean(dim=1, keepdim=True)) / (data.std(dim=1, keepdim=True) + 1e-6)
         
@@ -66,18 +66,16 @@ class SubjectSplitDataset(Dataset):
         sub_idx = int(sub) 
         time_idx = start // self.samples_per_window
         
+        if self.transform:
+            views = self.transform(data)
+            return views, torch.tensor(label, dtype=torch.long), torch.tensor(sub_idx, dtype=torch.long), torch.tensor(time_idx, dtype=torch.long)
+
         return data.contiguous(), torch.tensor(label, dtype=torch.long), torch.tensor(sub_idx, dtype=torch.long), torch.tensor(time_idx, dtype=torch.long)
 
 class ClinicalClassifier(nn.Module):
     def __init__(self, encoder, num_classes=2):
         super().__init__()
-        self.encoder = encoder
-        
-        # WE ARE UNFREEZING THE ENCODER
-        # By leaving requires_grad=True, the entire network will fine-tune
-        for param in self.encoder.parameters():
-            param.requires_grad = True
-            
+        self.encoder = encoder            
         self.classifier = nn.Linear(encoder.fc.out_features, num_classes)
 
     def forward(self, x):
@@ -135,18 +133,29 @@ def finetune_and_evaluate():
     test_dataset = SubjectSplitDataset('E:/SleepApneaProcessed', test_subs, label_dict)
 
     # shuffle=False is strictly required here to prevent the black-screen IO crash
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=False, drop_last=True, num_workers=0)
-    test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, drop_last=False, num_workers=0)
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=False, drop_last=True, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, drop_last=False, num_workers=0)
 
     # 2. Load Pre-trained Encoder & Build Model
-    encoder = EEGEncoder(in_channels=20)
-    weights_path = 'E:/SleepApnea/SleepApneaSSL/simclr_encoder.pth'
+    encoder = EEGEncoder(in_channels=20).to(device)
+    weights_path = 'E:/SleepApnea/SleepApneaSSL/iclr_pretrained_encoder.pth'
     encoder.load_state_dict(torch.load(weights_path, weights_only=True))
     
+    # Load the state dict and move the parameters to GPU
+    state_dict = torch.load(weights_path, weights_only=True)
+    
+    if 'module.' in list(state_dict.keys())[0]:
+        new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        encoder.load_state_dict(new_state_dict)
+    else:
+        encoder.load_state_dict(state_dict)
+
+
     model = ClinicalClassifier(encoder).to(device)
     
     # 3. Full Fine-Tuning Setup with AMP
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5, weight_decay=1e-4)
+    # Explicitly only pass the classifier's weights to the optimizer
+    optimizer = torch.optim.Adam(model.classifier.parameters(), lr=5e-5, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
     
     # Initialize the AMP Gradient Scaler
@@ -156,6 +165,7 @@ def finetune_and_evaluate():
     epochs = 10
     for epoch in range(epochs):
         model.train()
+        model.encoder.eval()
         total_loss, correct, total = 0, 0, 0
         
         for batch_idx, (data, labels, _, _) in enumerate(train_loader):
@@ -184,7 +194,6 @@ def finetune_and_evaluate():
         print(f"Epoch {epoch+1}/{epochs} | Train Loss: {total_loss/len(train_loader):.4f} | Train Acc: {acc:.2f}%")
         
         # --- ADD THIS RAM FLUSH ---
-        load_cached_subject.cache_clear()
         gc.collect()
         torch.cuda.empty_cache()
 

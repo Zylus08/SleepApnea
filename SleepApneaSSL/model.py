@@ -87,8 +87,11 @@ class STFTEncoder2D(nn.Module):
         
         self.fc = nn.Linear(128, embed_dim)
 
-    def forward(self, x):
-        specs = self.stft(x)
+    def forward(self, x, input_is_spec=False):
+        if not input_is_spec:
+            specs = self.stft(x)
+        else:
+            specs = x
         feats = self.conv_blocks(specs)
         feats = torch.flatten(feats, 1)
         return self.fc(feats)
@@ -106,8 +109,8 @@ class SimCLR(nn.Module):
             nn.Linear(embed_dim, projection_dim)
         )
 
-    def forward(self, x):
-        h = self.encoder(x)
+    def forward(self, x, input_is_spec=False):
+        h = self.encoder(x, input_is_spec=input_is_spec)
         z = self.projector(h)
         return h, z
 

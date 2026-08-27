@@ -4,23 +4,11 @@ import re
 import gc
 import random
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import IterableDataset, DataLoader
+from torch.amp import autocast, GradScaler
 from model import STFTEncoder2D, SimCLR
-
-# --- 2D SPECTROGRAM AUGMENTATIONS FOR SIMCLR ---
-class SpectrogramAugmenter:
-    """Applies random scale and noise augmentations to 1D raw waveforms before STFT."""
-    def __call__(self, x):
-        x_aug = x.clone()
-        if torch.rand(1).item() > 0.5:
-            scale = torch.empty(x_aug.size(0), 1).uniform_(0.8, 1.2)
-            x_aug = x_aug * scale
-        if torch.rand(1).item() > 0.5:
-            noise = torch.randn_like(x_aug) * 0.05
-            x_aug = x_aug + noise
-        return x_aug
+from physio_clr import SpectralSubbandMasking, PhysioCLRLoss
 
 class StreamingWindowDataset(IterableDataset):
     def __init__(self, data_dir='E:/SleepApneaProcessed'):
@@ -44,7 +32,6 @@ class StreamingWindowDataset(IterableDataset):
                 if pid not in test_ids:
                     self.valid_files.append(f)
 
-        self.augmenter = SpectrogramAugmenter()
         print(f"[+] Streaming Dataset initialized with {len(self.valid_files)} training subjects. Zero memory overhead.")
 
     def __iter__(self):
@@ -81,44 +68,16 @@ class StreamingWindowDataset(IterableDataset):
             
             # Now `bag` is guaranteed to be shape (N_windows, 20, 3000)
             n_windows = bag.size(0)
-            window_indices = list(range(n_windows))
-            random.shuffle(window_indices)  # Shuffle windows for contrastive variance
             
-            for w in window_indices:
+            # Sequential windows for Temporal Continuity Loss
+            for w in range(n_windows):
                 x = bag[w].float()  # Extracts a single (20, 3000) window
-                
-                x1 = self.augmenter(x)
-                x2 = self.augmenter(x)
-                
-                yield x1, x2
+                is_boundary = 1 if w == 0 else 0  # 1 indicates start of a new patient
+                yield x, is_boundary
             
             # Force memory cleanup before the next patient
             del bag
             gc.collect()
-            
-# --- NT-Xent LOSS ---
-class NTXentLoss(nn.Module):
-    def __init__(self, temperature=0.5):
-        super().__init__()
-        self.temperature = temperature
-        self.cosine_sim = nn.CosineSimilarity(dim=-1)
-
-    def forward(self, z_i, z_j):
-        batch_size = z_i.size(0)
-        z = torch.cat([z_i, z_j], dim=0)
-        sim_matrix = self.cosine_sim(z.unsqueeze(1), z.unsqueeze(0)) / self.temperature
-        
-        sim_i_j = torch.diag(sim_matrix, batch_size)
-        sim_j_i = torch.diag(sim_matrix, -batch_size)
-        positives = torch.cat([sim_i_j, sim_j_i], dim=0)
-        
-        mask = ~torch.eye(2 * batch_size, dtype=torch.bool, device=z.device)
-        negatives = sim_matrix[mask].view(2 * batch_size, -1)
-        
-        logits = torch.cat([positives.unsqueeze(1), negatives], dim=1)
-        labels = torch.zeros(2 * batch_size, dtype=torch.long, device=z.device)
-        
-        return nn.CrossEntropyLoss()(logits, labels)
 
 def train_simclr_2d():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -126,43 +85,72 @@ def train_simclr_2d():
     
     dataset = StreamingWindowDataset()
     # Note: IterableDataset does not support shuffle=True in DataLoader. 
-    # We already handle shuffling internally inside __iter__().
     loader = DataLoader(dataset, batch_size=128, shuffle=False, num_workers=0, drop_last=True)
     
     encoder = STFTEncoder2D(in_channels=20, embed_dim=128)
     simclr_model = SimCLR(encoder, projection_dim=64).to(device)
     
     optimizer = optim.AdamW(simclr_model.parameters(), lr=1e-3, weight_decay=1e-4)
-    criterion = NTXentLoss(temperature=0.5)
+    criterion = PhysioCLRLoss(temperature=0.07, lambda_temporal=0.15)
+    masker = SpectralSubbandMasking(p=0.5).to(device)
+    scaler = GradScaler('cuda')
     
     epochs = 15
-    print("\n--- STARTING 2D STFT SIMCLR PRE-TRAINING ---")
+    print("\n--- STARTING PHYSIO-CLR PRE-TRAINING ---")
     simclr_model.train()
+    masker.train()
     
     for epoch in range(1, epochs + 1):
         total_loss = 0.0
+        total_contrastive = 0.0
+        total_temporal = 0.0
         batch_count = 0
         
-        for x1, x2 in loader:
-            x1, x2 = x1.to(device), x2.to(device)
+        for x, is_boundary in loader:
+            x = x.to(device)
+            is_boundary = is_boundary.to(device)
             
             optimizer.zero_grad()
-            _, z1 = simclr_model(x1)
-            _, z2 = simclr_model(x2)
             
-            loss = criterion(z1, z2)
-            loss.backward()
-            optimizer.step()
+            with autocast('cuda'):
+                # 1. Generate STFT Spectrogram
+                with torch.no_grad():
+                    specs = simclr_model.encoder.stft(x)
+                
+                # 2. Spectral Subband Masking Augmentation
+                specs1 = masker(specs)
+                specs2 = masker(specs)
+                
+                # 3. Compute Projections
+                _, z1 = simclr_model(specs1, input_is_spec=True)
+                _, z2 = simclr_model(specs2, input_is_spec=True)
+                
+                # 4. Compute Physio-CLR Loss
+                loss, metrics = criterion(z1, z2, is_boundary)
             
-            total_loss += loss.item()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            total_loss += metrics['loss_total']
+            total_contrastive += metrics['loss_contrastive']
+            total_temporal += metrics['loss_temporal']
             batch_count += 1
             
-            # Print intermediate progress every 50 batches since we don't have len(loader)
             if batch_count % 50 == 0:
-                print(f"Epoch {epoch:02d} | Batch {batch_count:04d} | Current Loss: {loss.item():.4f}")
+                print(f"Epoch {epoch:02d} | Batch {batch_count:04d} | "
+                      f"Total Loss: {metrics['loss_total']:.4f} | "
+                      f"Contrastive: {metrics['loss_contrastive']:.4f} | "
+                      f"Temporal: {metrics['loss_temporal']:.4f}")
             
         avg_loss = total_loss / max(1, batch_count)
-        print(f">>> End of Epoch {epoch:02d}/{epochs:02d} | Average SimCLR Loss: {avg_loss:.4f}\n")
+        avg_contrastive = total_contrastive / max(1, batch_count)
+        avg_temporal = total_temporal / max(1, batch_count)
+        
+        print(f">>> End of Epoch {epoch:02d}/{epochs:02d} | "
+              f"Avg Total: {avg_loss:.4f} | "
+              f"Avg Contrastive: {avg_contrastive:.4f} | "
+              f"Avg Temporal: {avg_temporal:.4f}\n")
         
     torch.save(encoder.state_dict(), 'E:/SleepApnea/SleepApneaSSL/stft_pretrained_encoder.pth')
     print("\n[+] Saved pre-trained 2D encoder to 'stft_pretrained_encoder.pth'")

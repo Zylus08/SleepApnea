@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from torch.amp import autocast
 
 # Import the architecture and dataset directly from your training script
-from model import EEGEncoder
+from model import STFTEncoder2D
 from mil_train import PatientBagDataset, AttentionMIL
 
 def evaluate_production_mil():
@@ -39,13 +39,18 @@ def evaluate_production_mil():
     print(f"\n--- DATASET SCALING ---")
     print(f"Evaluating strictly on {len(test_subs)} UNSEEN Test Subjects")
     
-    test_dataset = PatientBagDataset('E:/SleepApneaProcessed', test_subs, label_dict)
+    test_dataset = PatientBagDataset('E:/SleepApneaProcessed', test_subs, label_dict, is_training=False)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
 
     # 2. Load the Production AB-MIL Model
-    base_encoder = EEGEncoder(in_channels=20)
+    base_encoder = STFTEncoder2D(in_channels=20, embed_dim=128)
     model = AttentionMIL(base_encoder).to(device)
-    model.load_state_dict(torch.load('E:/SleepApnea/SleepApneaSSL/mil_production_model.pth', weights_only=True))
+    checkpoint = torch.load('E:/SleepApnea/SleepApneaSSL/mil_checkpoint.pth', weights_only=True)
+    if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
+        model.load_state_dict(checkpoint['model_state'])
+    else:
+        model.load_state_dict(checkpoint)
+
     model.eval()
 
     all_probs = []

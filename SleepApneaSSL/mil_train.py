@@ -6,16 +6,18 @@ import pandas as pd
 import numpy as np
 import random
 from torch.amp import autocast, GradScaler
-from model import EEGEncoder
+from model import STFTEncoder2D, SimCLR
 import gc
 
 # --- 1. PATIENT-LEVEL DATASET (THE "BAG") ---
 class PatientBagDataset(Dataset):
-    def __init__(self, processed_root, subjects, label_dict):
+    def __init__(self, processed_root, subjects, label_dict, is_training=True):
         self.processed_root = processed_root
         self.subjects = subjects
         self.label_dict = label_dict
         self.samples_per_window = 3000
+        self.is_training = is_training
+        self.crop_windows = 480 # Standardize exactly 4 hours of sleep
 
     def __len__(self):
         return len(self.subjects)
@@ -25,62 +27,90 @@ class PatientBagDataset(Dataset):
         label = self.label_dict[sub]
         pt_path = os.path.join(self.processed_root, f'sub-{sub}_eeg.pt')
         
-        # Load entire patient directly from disk
         tensor_data = torch.load(pt_path, weights_only=True)
         total_samples = tensor_data.shape[1]
+        total_windows = total_samples // self.samples_per_window
         
-        # Chop the night into 30-second windows
+        # --- PHASE 2: SEQUENCE STANDARDIZATION ---
+        if self.is_training and total_windows > self.crop_windows:
+            # Randomly crop a continuous 4-hour segment for data augmentation
+            start_window = random.randint(0, total_windows - self.crop_windows)
+            start_idx = start_window * self.samples_per_window
+            end_idx = start_idx + (self.crop_windows * self.samples_per_window)
+            tensor_data = tensor_data[:, start_idx:end_idx]
+        else:
+            # For testing, just take the first 4 hours to ensure standard tensor sizes
+            tensor_data = tensor_data[:, :self.crop_windows * self.samples_per_window]
+
         windows = []
-        for start in range(0, total_samples - self.samples_per_window, self.samples_per_window):
+        for start in range(0, tensor_data.shape[1], self.samples_per_window):
             window = tensor_data[:, start:start + self.samples_per_window].clone()
-            # Normalize each window
+            # Normalize
             window = (window - window.mean(dim=1, keepdim=True)) / (window.std(dim=1, keepdim=True) + 1e-6)
+            
+            # --- PHASE 3: ARTIFACT MASKING ---
+            if self.is_training:
+                # Inject 10% Gaussian Noise to force the model to ignore sensor glitches
+                noise = torch.randn_like(window) * 0.1 
+                window = window + noise
+                
             windows.append(window)
             
-        # Shape: (N_windows, 20, 3000)
         bag = torch.stack(windows)
-        del tensor_data
-        gc.collect()
+        
+        del tensor_data 
+        gc.collect() 
+        
         return bag, torch.tensor([label], dtype=torch.float32)
 
 # --- 2. MEMORY-SAFE AB-MIL MODEL ---
 class AttentionMIL(nn.Module):
-    def __init__(self, encoder, input_dim=128, attention_dim=64):
+    def __init__(self, encoder, embed_dim=128, hidden_dim=64):
         super().__init__()
         self.encoder = encoder
         
-        # Unfreeze encoder for end-to-end learning
-        for param in self.encoder.parameters():
-            param.requires_grad = True
-            
-        self.attention_V = nn.Sequential(nn.Linear(input_dim, attention_dim), nn.Tanh())
-        self.attention_U = nn.Sequential(nn.Linear(input_dim, attention_dim), nn.Sigmoid())
-        self.attention_w = nn.Linear(attention_dim, 1)
+        # Gated Attention Mechanism
+        self.attention_V = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.Tanh()
+        )
+        self.attention_U = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.Sigmoid()
+        )
+        self.attention_w = nn.Linear(hidden_dim, 1)
         
-        # Binary classification output (1 node for Probability of OSA)
-        self.classifier = nn.Linear(input_dim, 1)
+        # Patient-level classifier
+        self.classifier = nn.Linear(embed_dim, 1)
 
-    def forward(self, x, chunk_size=64):
-        # Memory-safe encoding: process the night in chunks
+    def forward(self, bag):
+        # bag shape: (480, 20, 3000)
+        num_windows = bag.size(0)
+        chunk_size = 32  # Micro-batch size to keep VRAM < 1.5 GB
+        
         embeddings = []
-        for i in range(0, x.size(0), chunk_size):
-            chunk = x[i:i+chunk_size]
-            embeddings.append(self.encoder(chunk))
+        for i in range(0, num_windows, chunk_size):
+            chunk = bag[i:i + chunk_size]
+            emb = self.encoder(chunk) # Shape: (32, 128)
+            embeddings.append(emb)
             
-        h = torch.cat(embeddings, dim=0) # Shape: (N_windows, 128)
+        # Stack back into a single matrix H: (480, 128)
+        H = torch.cat(embeddings, dim=0)
         
-        # Attention Mechanism
-        A_V = self.attention_V(h) 
-        A_U = self.attention_U(h) 
-        A = self.attention_w(A_V * A_U) 
-        A = torch.softmax(A, dim=0)  # Weights sum to 1.0
+        # Calculate Attention Weights
+        A_V = self.attention_V(H)
+        A_U = self.attention_U(H)
+        A = self.attention_w(A_V * A_U) # Element-wise multiplication (Gated Attention)
+        A = torch.transpose(A, 1, 0)     # (1, 480)
+        A = torch.softmax(A, dim=1)      # Normalize weights across all 480 windows
         
-        # Aggregate and Classify
-        patient_vector = torch.mm(A.t(), h) # Shape: (1, 128)
-        logits = self.classifier(patient_vector) # Shape: (1, 1)
+        # Aggregate bag representation (weighted sum)
+        M = torch.mm(A, H)               # (1, 128)
+        
+        # Predict patient-level probability logit
+        logits = self.classifier(M)      # (1, 1)
         
         return logits, A
-
 # --- 3. TRAINING LOOP WITH GRADIENT ACCUMULATION ---
 def train_mil():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -115,12 +145,12 @@ def train_mil():
     print(f"Reserved for Testing: {len(test_subs)} subjects")
     
     # Batch size is strictly 1 (One patient per step)
-    train_dataset = PatientBagDataset('E:/SleepApneaProcessed', train_subs, label_dict)
+    train_dataset = PatientBagDataset('E:/SleepApneaProcessed', train_subs, label_dict, is_training=True)
     train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=0)
 
     # 3. Initialize Models
-    base_encoder = EEGEncoder(in_channels=20)
-    base_encoder.load_state_dict(torch.load('E:/SleepApnea/SleepApneaSSL/iclr_pretrained_encoder.pth', weights_only=True))
+    base_encoder = STFTEncoder2D(in_channels=20, embed_dim=128)
+    # base_encoder.load_state_dict(torch.load('E:/SleepApnea/SleepApneaSSL/iclr_pretrained_encoder.pth', weights_only=True))
     
     model = AttentionMIL(base_encoder).to(device)
     checkpoint_path = 'E:/SleepApnea/SleepApneaSSL/mil_checkpoint.pth'

@@ -13,6 +13,7 @@ from torch.utils.data import IterableDataset, DataLoader
 from sklearn.metrics import accuracy_score, recall_score, f1_score, roc_auc_score, roc_curve
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingLR
+import argparse
 
 # Import encoder model definition
 from model import STFTEncoder2D
@@ -108,20 +109,52 @@ class BinaryFocalLossWithLogits(nn.Module):
         return loss
 
 
+class WeightedBCEWithLogits(nn.Module):
+    """
+    Binary Cross-Entropy with class-frequency-derived pos_weight.
+
+    Automatically up-weights the minority class to compensate for
+    class imbalance without the focusing mechanism of Focal Loss.
+
+    Args:
+        pos_weight (float): Weight for the positive (OSA) class.
+                            Typically ``n_negative / n_positive``.
+        reduction (str): 'mean' | 'sum' | 'none'.
+    """
+    def __init__(self, pos_weight: float = 1.0, reduction: str = 'mean'):
+        super().__init__()
+        self.reduction = reduction
+        self.register_buffer('pos_weight', torch.tensor([pos_weight]))
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return F.binary_cross_entropy_with_logits(
+            logits, targets,
+            pos_weight=self.pos_weight,
+            reduction=self.reduction,
+        )
+
+
 # ---------------------------------------------------------------------------
 # DOWNSTREAM CLASSIFIER MODEL
 # ---------------------------------------------------------------------------
 class SleepApneaClassifier(nn.Module):
-    def __init__(self, encoder, embed_dim=128):
+    """
+    Binary classifier that wraps an SSL-pretrained encoder with a
+    2-layer MLP head.
+
+    Supports three fine-tuning modes:
+        - ``frozen``    : Encoder weights fixed; only the MLP head trains.
+        - ``layerwise`` : Encoder gradually unfrozen with discriminative LR.
+        - ``full``      : All parameters trainable at a single LR.
+    """
+    VALID_MODES = ('frozen', 'layerwise', 'full')
+
+    def __init__(self, encoder, embed_dim=128, finetune_mode='frozen'):
         super().__init__()
         self.encoder = encoder
+        self._finetune_mode = None  # Will be set by set_finetune_mode()
 
-        # Feature-extractor mode: encoder stays frozen throughout training
-        print("[+] Feature Extractor Mode: Freezing SSL encoder weights permanently.")
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-
-        # 2-layer MLP projection head (trainable)
+        # 2-layer MLP projection head (always trainable)
         self.classifier = nn.Sequential(
             nn.Linear(embed_dim, 128),
             nn.BatchNorm1d(128),
@@ -130,8 +163,72 @@ class SleepApneaClassifier(nn.Module):
             nn.Linear(128, 1)
         )
 
+        # Apply initial finetune mode
+        self.set_finetune_mode(finetune_mode)
+
+    def set_finetune_mode(self, mode: str):
+        """
+        Configure which parameters are trainable.
+
+        Parameters
+        ----------
+        mode : str
+            One of 'frozen', 'layerwise', 'full'.
+        """
+        if mode not in self.VALID_MODES:
+            raise ValueError(f"finetune_mode must be one of {self.VALID_MODES}, got '{mode}'")
+
+        self._finetune_mode = mode
+
+        if mode == 'frozen':
+            print("[+] Finetune mode: FROZEN — encoder weights permanently fixed.")
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+
+        elif mode == 'layerwise':
+            print("[+] Finetune mode: LAYERWISE — encoder unfrozen with discriminative LR.")
+            for param in self.encoder.parameters():
+                param.requires_grad = True
+
+        elif mode == 'full':
+            print("[+] Finetune mode: FULL — all parameters trainable at single LR.")
+            for param in self.encoder.parameters():
+                param.requires_grad = True
+
+    def get_layerwise_param_groups(self, base_lr: float):
+        """
+        Build parameter groups with discriminative learning rates.
+
+        Encoder conv layers   → base_lr / 100  (nearly frozen)
+        Encoder FC layer      → base_lr / 10
+        Classifier MLP head   → base_lr
+
+        Returns
+        -------
+        list[dict] — parameter groups suitable for ``torch.optim.AdamW``.
+        """
+        conv_params = []
+        fc_params = []
+
+        for name, param in self.encoder.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'fc' in name:
+                fc_params.append(param)
+            else:
+                conv_params.append(param)
+
+        return [
+            {'params': conv_params,                'lr': base_lr / 100, 'name': 'encoder_conv'},
+            {'params': fc_params,                  'lr': base_lr / 10,  'name': 'encoder_fc'},
+            {'params': self.classifier.parameters(), 'lr': base_lr,      'name': 'classifier'},
+        ]
+
     def forward(self, x):
-        with torch.no_grad():
+        if self._finetune_mode == 'frozen':
+            with torch.no_grad():
+                features = self.encoder(x)
+        else:
             features = self.encoder(x)
         logits = self.classifier(features)
         return logits.view(-1)  # Output shape: [batch_size]
@@ -311,17 +408,69 @@ def evaluate(model, loader, device):
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
+def _select_criterion(loss_type: str, num_healthy: int, num_osa: int):
+    """
+    Instantiate the loss function based on the selected type.
+
+    Parameters
+    ----------
+    loss_type : str
+        One of 'focal' or 'weighted_bce'.
+    num_healthy : int
+        Number of healthy (negative) subjects in training set.
+    num_osa : int
+        Number of OSA (positive) subjects in training set.
+    """
+    if loss_type == 'focal':
+        criterion = BinaryFocalLossWithLogits(alpha=0.55, gamma=1.0)
+        print(f"[+] Using Binary Focal Loss (alpha=0.55, gamma=1.0)")
+    elif loss_type == 'weighted_bce':
+        pos_weight = num_healthy / max(num_osa, 1)
+        criterion = WeightedBCEWithLogits(pos_weight=pos_weight)
+        print(f"[+] Using Weighted BCE Loss (pos_weight={pos_weight:.2f})")
+    else:
+        raise ValueError(f"Unknown loss_type: '{loss_type}'. Use 'focal' or 'weighted_bce'.")
+    return criterion
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Downstream Fine-Tuning for Sleep Apnea Classification")
+    parser.add_argument('--finetune-mode', type=str, default='frozen', choices=['frozen', 'layerwise', 'full'],
+                        help="Fine-tuning mode: 'frozen', 'layerwise', or 'full'")
+    parser.add_argument('--loss-type', type=str, default='focal', choices=['focal', 'weighted_bce'],
+                        help="Loss type: 'focal' or 'weighted_bce'")
+    parser.add_argument('--lr', type=float, default=1e-3, help="Base learning rate")
+    parser.add_argument('--epochs', type=int, default=15, help="Number of training epochs")
+    parser.add_argument('--data-dir', type=str, default=r'E:\SleepApneaProcessed', help="Directory with processed .pt files")
+    parser.add_argument('--tsv-path', type=str, default=r'E:\SleepApnea\participants.tsv', help="Path to BIDS participants.tsv")
+    parser.add_argument('--weights-path', type=str, default=r'E:\SleepApnea\SleepApneaSSL\stft_pretrained_encoder.pth', help="Path to pretrained encoder weights")
+    parser.add_argument('--checkpoint-path', type=str, default=r'E:\SleepApnea\SleepApneaSSL\best_downstream_model.pth', help="Path to save the best model")
+    args = parser.parse_args()
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # File Paths
-    data_dir             = r'E:\SleepApneaProcessed'
-    tsv_path             = r'E:\SleepApnea\participants.tsv'
-    weights_path         = r'E:\SleepApnea\SleepApneaSSL\stft_pretrained_encoder.pth'
-    checkpoint_save_path = r'E:\SleepApnea\SleepApneaSSL\best_downstream_model.pth'
+    # -----------------------------------------------------------------------
+    # CONFIGURATION
+    # -----------------------------------------------------------------------
+    data_dir             = args.data_dir
+    tsv_path             = args.tsv_path
+    weights_path         = args.weights_path
+    checkpoint_save_path = args.checkpoint_path
 
+    # Finetune mode: 'frozen' | 'layerwise' | 'full'
+    finetune_mode = args.finetune_mode
+
+    # Loss type: 'focal' | 'weighted_bce'
+    loss_type = args.loss_type
+
+    # Training hyperparameters
+    base_lr    = args.lr
+    num_epochs = args.epochs
+
+    # -----------------------------------------------------------------------
     # 1. Parse BIDS Labels from TSV
+    # -----------------------------------------------------------------------
     label_map = load_bids_labels(tsv_path)
 
     # 2. Train / Test Split by Subject ID (Stratified 80/20)
@@ -354,7 +503,9 @@ def main():
             elif pid in test_ids:
                 test_files.append(f)
 
+    # -----------------------------------------------------------------------
     # 3. Initialize Encoder & Load Pre-trained SSL Weights
+    # -----------------------------------------------------------------------
     encoder = STFTEncoder2D(in_channels=20, embed_dim=128)
     if os.path.exists(weights_path):
         encoder.load_state_dict(torch.load(weights_path, map_location=device, weights_only=True))
@@ -362,16 +513,19 @@ def main():
     else:
         print(f"[!] Warning: Pre-trained weights file '{weights_path}' not found. Initializing randomly.")
 
-    # 4. Focal Loss Criterion (softened to prevent gradient starvation)
+    # -----------------------------------------------------------------------
+    # 4. Loss Criterion
+    # -----------------------------------------------------------------------
     train_labels = [label_map[pid] for pid in train_ids]
     num_healthy  = train_labels.count(0.0)
     num_osa      = train_labels.count(1.0)
     print(f"[i] Class distribution in Train set -> Healthy: {num_healthy} | OSA: {num_osa}")
 
-    criterion = BinaryFocalLossWithLogits(alpha=0.55, gamma=1.0)
-    print(f"[+] Using Binary Focal Loss (alpha=0.55, gamma=1.0)")
+    criterion = _select_criterion(loss_type, num_healthy, num_osa)
 
+    # -----------------------------------------------------------------------
     # 5. Data Loaders (no online augmentations — clean STFT patterns)
+    # -----------------------------------------------------------------------
     train_loader = DataLoader(
         LabeledStreamingDataset(train_files, label_map, is_train=True),
         batch_size=128, shuffle=False
@@ -382,23 +536,39 @@ def main():
     )
 
     # -----------------------------------------------------------------------
-    # FEATURE EXTRACTOR TRAINING (encoder frozen, MLP head only)
+    # 6. Model & Optimizer (mode-aware)
     # -----------------------------------------------------------------------
+    mode_label = {
+        'frozen':    'FEATURE EXTRACTOR: MLP HEAD TRAINING (Encoder Frozen)',
+        'layerwise': 'LAYERWISE FINE-TUNING (Discriminative LR)',
+        'full':      'FULL FINE-TUNING (All Parameters)',
+    }
     print("\n" + "=" * 60)
-    print("  FEATURE EXTRACTOR: MLP HEAD TRAINING (Encoder Frozen)")
+    print(f"  {mode_label[finetune_mode]}")
     print("=" * 60)
-    model = SleepApneaClassifier(encoder, embed_dim=128).to(device)
 
-    # Only optimise the classifier MLP head
-    optimizer = optim.AdamW(model.classifier.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = CosineAnnealingLR(optimizer, T_max=15, eta_min=1e-5)
+    model = SleepApneaClassifier(encoder, embed_dim=128, finetune_mode=finetune_mode).to(device)
+
+    if finetune_mode == 'layerwise':
+        param_groups = model.get_layerwise_param_groups(base_lr)
+        optimizer = optim.AdamW(param_groups, weight_decay=1e-4)
+        for pg in param_groups:
+            print(f"  [{pg.get('name', '?')}] LR: {pg['lr']:.2e} | Params: {sum(p.numel() for p in pg['params']):,}")
+    elif finetune_mode == 'full':
+        optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-4)
+    else:  # frozen
+        optimizer = optim.AdamW(model.classifier.parameters(), lr=base_lr, weight_decay=1e-4)
+
+    scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-5)
 
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total     = sum(p.numel() for p in model.parameters())
     print(f"[i] Trainable parameters: {n_trainable:,} / {n_total:,} total")
 
+    # -----------------------------------------------------------------------
+    # 7. Training Loop
+    # -----------------------------------------------------------------------
     best_auc = 0.0
-    num_epochs = 15
 
     for epoch in range(1, num_epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)

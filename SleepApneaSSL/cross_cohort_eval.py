@@ -4,11 +4,6 @@ Cross-Cohort Evaluation Pipeline — ICLR Submission
 Evaluates an OSA detection model (trained on ds008108) against the
 Sleep-EDF Expanded dataset as a *domain-shift robustness probe*.
 
-The model was trained for binary sleep apnea classification (OSA vs Control).
-Here we repurpose it on a different task (Wake vs Sleep staging) to measure
-how well the SSL encoder's representations transfer across cohorts and
-task semantics.
-
 Outputs
 -------
 - cross_cohort_results.npz : raw logits, probabilities, targets, subject IDs
@@ -17,9 +12,9 @@ Outputs
 
 Usage
 -----
-    python cross_cohort_eval.py                    # Full 306-subject evaluation
+    python cross_cohort_eval.py                    # Full evaluation
     python cross_cohort_eval.py --max-subjects 5   # Quick sanity check
-    python cross_cohort_eval.py --verbose           # Enable per-batch diagnostics
+    python cross_cohort_eval.py --verbose          # Enable per-batch diagnostics
 """
 
 import argparse
@@ -36,6 +31,7 @@ import matplotlib.pyplot as plt
 import mne
 import numpy as np
 import torch
+import torch.nn as nn
 from sklearn.metrics import (
     average_precision_score,
     classification_report,
@@ -47,9 +43,8 @@ from sklearn.metrics import (
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
-# Project imports
-from downstream_finetune import SleepApneaClassifier
-from model import STFTEncoder2D
+# Project imports - ensure complete architectural parity
+from downstream_finetune import SleepApneaClassifier, STFTEncoder2D
 
 # Suppress MNE and runtime warnings globally
 mne.set_log_level("ERROR")
@@ -180,20 +175,25 @@ def extract_epochs(psg_path, hyp_path):
         return None, None, subject_id
 
 
+def parse_sleep_edf_annotations(annotations, total_windows):
+    """
+    Extracts explicit Apnea/Hypopnea event annotations (1) 
+    vs Normal Breathing (0), bypassing sleep stage binarization.
+    """
+    labels = np.zeros(total_windows, dtype=int)
+    for ann in annotations:
+        if any(term in ann["description"].lower() for term in ["apnea", "hypopnea"]):
+            start_idx = int(ann["onset"] / 30.0)
+            duration = int(ann["duration"] / 30.0)
+            labels[start_idx : start_idx + duration] = 1
+    return labels
+
+
 # ==========================================
 # 4. DYNAMIC EVALUATION METRICS
 # ==========================================
 def compute_youden_threshold(targets, probs):
-    """
-    Find the optimal decision threshold using Youden's J statistic.
-
-    J = max(TPR - FPR) over all thresholds on the ROC curve.
-
-    Returns
-    -------
-    threshold : float — optimal decision boundary
-    auroc : float — area under the ROC curve
-    """
+    """Find the optimal decision threshold using Youden's J statistic."""
     try:
         auroc = roc_auc_score(targets, probs)
         fpr, tpr, thresholds = roc_curve(targets, probs)
@@ -201,52 +201,33 @@ def compute_youden_threshold(targets, probs):
         best_idx = np.argmax(j_scores)
         return float(thresholds[best_idx]), float(auroc)
     except ValueError:
-        # Happens when only one class is present
         return 0.5, float("nan")
 
 
 def compute_all_metrics(targets, probs, logits):
-    """
-    Compute a comprehensive set of evaluation metrics.
-
-    Parameters
-    ----------
-    targets : np.ndarray — binary ground-truth labels
-    probs : np.ndarray — sigmoid probabilities
-    logits : np.ndarray — raw model logits (pre-sigmoid)
-
-    Returns
-    -------
-    metrics : dict — all computed metrics
-    """
+    """Compute comprehensive evaluation metrics."""
     metrics = {}
 
-    # 1. AUROC
     try:
         metrics["auroc"] = roc_auc_score(targets, probs)
     except ValueError:
         metrics["auroc"] = float("nan")
 
-    # 2. Macro AUPRC (Average Precision)
     try:
         metrics["auprc"] = average_precision_score(targets, probs)
     except ValueError:
         metrics["auprc"] = float("nan")
 
-    # 3. Youden's J optimal threshold
     threshold, _ = compute_youden_threshold(targets, probs)
     metrics["youden_threshold"] = threshold
 
-    # 4. Classification at optimal threshold
     preds_optimal = (probs >= threshold).astype(int)
     metrics["macro_f1"] = f1_score(targets, preds_optimal, average="macro", zero_division=0)
 
-    # 5. Class distribution
     metrics["n_wake"] = int(np.sum(targets == 0))
     metrics["n_sleep"] = int(np.sum(targets == 1))
     metrics["prevalence_sleep"] = float(np.mean(targets))
 
-    # 6. Logit statistics (for diagnosing collapse)
     metrics["logit_mean"] = float(np.mean(logits))
     metrics["logit_std"] = float(np.std(logits))
     metrics["logit_min"] = float(np.min(logits))
@@ -259,7 +240,7 @@ def compute_all_metrics(targets, probs, logits):
 # 5. VISUALIZATION
 # ==========================================
 def plot_prediction_distribution(targets, logits, probs, output_path):
-    """Generate a publication-quality figure showing logit and probability distributions."""
+    """Generate publication-quality figure showing logit and probability distributions."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     # Panel A: Raw logit distribution
@@ -294,19 +275,12 @@ def plot_prediction_distribution(targets, logits, probs, output_path):
 # 6. MAIN EVALUATION LOOP
 # ==========================================
 def run_external_evaluation(model, data_pairs, verbose=False):
-    """
-    Run inference on all Sleep-EDF subjects and compute cross-cohort metrics.
-
-    Collects raw logits (not binary predictions) and applies dynamic
-    thresholding post-hoc for rigorous evaluation.
-    """
     model.eval()
 
-    # Accumulators — raw continuous values, NOT binary
-    all_logits = []      # Raw model output (pre-sigmoid)
-    all_probs = []       # Sigmoid probabilities
-    all_targets = []     # Ground-truth AASM labels (0–4)
-    all_subject_ids = [] # Subject identifier per epoch
+    all_logits = []
+    all_probs = []
+    all_targets = []
+    all_subject_ids = []
 
     n_subjects = len(data_pairs)
     n_skipped = 0
@@ -334,14 +308,12 @@ def run_external_evaluation(model, data_pairs, verbose=False):
         with torch.no_grad():
             for (batch_x,) in loader:
                 batch_x = batch_x.to(DEVICE)
-                outputs = model(batch_x)  # Raw logits, shape: [batch_size]
+                outputs = model(batch_x)
 
                 if verbose and len(subject_logits) == 0:
                     print(f"  [{subject_id}] batch_x: {batch_x.shape} → outputs: {outputs.shape}")
 
-                # Collect raw logits on CPU immediately to avoid GPU memory accumulation
                 subject_logits.append(outputs.cpu().numpy())
-
                 del batch_x, outputs
 
         subject_logits = np.concatenate(subject_logits)
@@ -354,27 +326,21 @@ def run_external_evaluation(model, data_pairs, verbose=False):
             n_skipped += 1
             continue
 
-        # Accumulate raw continuous values
         all_logits.append(subject_logits)
-        all_probs.append(1.0 / (1.0 + np.exp(-subject_logits)))  # Sigmoid
+        all_probs.append(1.0 / (1.0 + np.exp(-subject_logits)))
         all_targets.append(y)
         all_subject_ids.append(np.full(len(y), idx, dtype=np.int32))
 
-        # Memory management: explicit cleanup every N subjects
         del X, y, X_tensor, dataset, loader, subject_logits
         gc.collect()
         if torch.cuda.is_available() and (idx + 1) % CUDA_FLUSH_INTERVAL == 0:
             torch.cuda.empty_cache()
 
-        # ETA estimation
         if (idx + 1) % 20 == 0:
             elapsed = time.time() - start_time
             eta = elapsed / (idx + 1) * (n_subjects - idx - 1)
             print(f"  [{idx+1}/{n_subjects}] Elapsed: {elapsed/60:.1f}m | ETA: {eta/60:.1f}m")
 
-    # ==============================================
-    # AGGREGATE AND EVALUATE
-    # ==============================================
     if not all_logits:
         print("[!] No evaluation samples gathered.")
         return
@@ -392,7 +358,6 @@ def run_external_evaluation(model, data_pairs, verbose=False):
           f"{n_skipped} skipped. Total time: {elapsed_total/60:.1f} minutes.")
     print(f"[*] Total epochs evaluated: {len(all_targets_binary)}")
 
-    # ----- Save raw results for offline analysis -----
     npz_path = os.path.join(OUTPUT_DIR, "cross_cohort_results.npz")
     np.savez(
         npz_path,
@@ -404,7 +369,6 @@ def run_external_evaluation(model, data_pairs, verbose=False):
     )
     print(f"[+] Raw results saved to {npz_path}")
 
-    # ----- Compute and display metrics -----
     metrics, preds_optimal = compute_all_metrics(
         all_targets_binary, all_probs_arr, all_logits_arr
     )
@@ -422,11 +386,9 @@ def run_external_evaluation(model, data_pairs, verbose=False):
     print(f"  Logit stats:  mean={metrics['logit_mean']:.4f}  std={metrics['logit_std']:.4f}  "
           f"range=[{metrics['logit_min']:.4f}, {metrics['logit_max']:.4f}]")
 
-    # Collapse warning
     if metrics["logit_std"] < 1e-3:
         print("\n  ! WARNING: Near-zero logit variance detected.")
         print("    The encoder likely suffers from representation collapse on this cohort.")
-        print("    Consider layer-wise fine-tuning (see downstream_finetune.py --finetune-mode layerwise).")
 
     print("\n" + "-" * 60)
     print("  Classification Report (at Youden-optimal threshold)")
@@ -440,7 +402,6 @@ def run_external_evaluation(model, data_pairs, verbose=False):
         )
     )
 
-    # ----- Visualization -----
     plot_path = os.path.join(OUTPUT_DIR, "prediction_distribution.png")
     plot_prediction_distribution(all_targets_binary, all_logits_arr, all_probs_arr, plot_path)
 
@@ -477,11 +438,16 @@ if __name__ == "__main__":
         print(f"[*] Limited to {args.max_subjects} subjects for quick evaluation.")
 
     print("[*] Loading Model...")
-    base_encoder = STFTEncoder2D()
-    model = SleepApneaClassifier(base_encoder).to(DEVICE)
-
+    encoder = STFTEncoder2D()
+    model = SleepApneaClassifier(encoder=encoder).to(DEVICE)
+    
     state_dict = torch.load(args.model_path, map_location=DEVICE, weights_only=True)
-    model.load_state_dict(state_dict)
+
+    if "model_state_dict" in state_dict:
+        state_dict = state_dict["model_state_dict"]
+
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    print(f"[+] Loaded weights successfully (Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)})")
     print(f"[+] Model loaded from {args.model_path}")
 
     if len(file_pairs) > 0:

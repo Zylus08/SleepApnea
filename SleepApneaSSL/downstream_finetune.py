@@ -14,9 +14,11 @@ from sklearn.metrics import accuracy_score, recall_score, f1_score, roc_auc_scor
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import argparse
+from itertools import cycle
 
 # Import encoder model definition
 from model import STFTEncoder2D
+from mmd_loss import GaussianMMDLoss
 
 
 # ---------------------------------------------------------------------------
@@ -195,17 +197,9 @@ class SleepApneaClassifier(nn.Module):
             for param in self.encoder.parameters():
                 param.requires_grad = True
 
-    def get_layerwise_param_groups(self, base_lr: float):
+    def get_layerwise_param_groups(self, lr_conv: float, lr_fc: float, lr_head: float):
         """
         Build parameter groups with discriminative learning rates.
-
-        Encoder conv layers   → base_lr / 100  (nearly frozen)
-        Encoder FC layer      → base_lr / 10
-        Classifier MLP head   → base_lr
-
-        Returns
-        -------
-        list[dict] — parameter groups suitable for ``torch.optim.AdamW``.
         """
         conv_params = []
         fc_params = []
@@ -216,22 +210,41 @@ class SleepApneaClassifier(nn.Module):
             if 'fc' in name:
                 fc_params.append(param)
             else:
-                conv_params.append(param)
+                # Freeze conv blocks by default to preserve universal time-frequency filters
+                param.requires_grad = False
 
-        return [
-            {'params': conv_params,                'lr': base_lr / 100, 'name': 'encoder_conv'},
-            {'params': fc_params,                  'lr': base_lr / 10,  'name': 'encoder_fc'},
-            {'params': self.classifier.parameters(), 'lr': base_lr,      'name': 'classifier'},
+        groups = [
+            {'params': fc_params, 'lr': lr_fc, 'name': 'encoder_fc'},
+            {'params': self.classifier.parameters(), 'lr': lr_head, 'name': 'classifier'},
         ]
-
-    def forward(self, x):
+        if conv_params:
+            groups.insert(0, {'params': conv_params, 'lr': lr_conv, 'name': 'encoder_conv'})
+            
+        return groups
+        
+    def forward_with_features(self, x):
         if self._finetune_mode == 'frozen':
             with torch.no_grad():
                 features = self.encoder(x)
         else:
             features = self.encoder(x)
-        logits = self.classifier(features)
-        return logits.view(-1)  # Output shape: [batch_size]
+            
+        # Hook post-fc embeddings after GELU, strictly before Dropout
+        h = features
+        for i in range(3): # Linear -> BatchNorm -> GELU
+            h = self.classifier[i](h)
+            
+        post_fc_embed = h
+        
+        for i in range(3, len(self.classifier)): # Dropout -> Linear
+            h = self.classifier[i](h)
+            
+        logits = h.view(-1)
+        return post_fc_embed, logits
+
+    def forward(self, x):
+        _, logits = self.forward_with_features(x)
+        return logits
 
 
 # ---------------------------------------------------------------------------
@@ -304,25 +317,49 @@ class LabeledStreamingDataset(IterableDataset):
 # ---------------------------------------------------------------------------
 # TRAINING ENGINE
 # ---------------------------------------------------------------------------
-def train_one_epoch(model, loader, optimizer, criterion, device):
+def train_one_epoch(model, source_loader, target_loader, optimizer, criterion, mmd_criterion, lambda_mmd, device):
     model.train()
+    total_task_loss = 0.0
+    total_mmd_loss = 0.0
     total_loss = 0.0
     count = 0
 
-    for x, y, _pid in loader:
-        x = x.to(device)
-        y = y.to(device).float().view(-1)
+    target_iter = cycle(target_loader)
+
+    for src_x, src_y, _ in source_loader:
+        src_x = src_x.to(device)
+        src_y = src_y.to(device).float().view(-1)
+        
+        # Get next unsupervised target batch
+        tgt_x, _, _ = next(target_iter)
+        tgt_x = tgt_x.to(device)
 
         optimizer.zero_grad()
-        logits = model(x)
-        loss = criterion(logits, y)
+        
+        # Forward pass source
+        features_src, logits_src = model.forward_with_features(src_x)
+        
+        # Forward pass target
+        features_tgt, _ = model.forward_with_features(tgt_x)
+        
+        # Task Loss (on source)
+        l_task = criterion(logits_src, src_y)
+        
+        # MMD Loss (source vs target representations)
+        l_mmd = mmd_criterion(features_src, features_tgt)
+        
+        # Total Loss
+        loss = l_task + lambda_mmd * l_mmd
+        
         loss.backward()
         optimizer.step()
 
+        total_task_loss += l_task.item()
+        total_mmd_loss += l_mmd.item()
         total_loss += loss.item()
         count += 1
 
-    return total_loss / max(1, count)
+    return total_task_loss / max(1, count), total_mmd_loss / max(1, count), total_loss / max(1, count)
 
 
 # ---------------------------------------------------------------------------
@@ -439,9 +476,13 @@ def main():
                         help="Fine-tuning mode: 'frozen', 'layerwise', or 'full'")
     parser.add_argument('--loss-type', type=str, default='focal', choices=['focal', 'weighted_bce'],
                         help="Loss type: 'focal' or 'weighted_bce'")
-    parser.add_argument('--lr', type=float, default=1e-3, help="Base learning rate")
+    parser.add_argument('--lr-conv', type=float, default=1e-5, help="Base learning rate for conv block")
+    parser.add_argument('--lr-post-fc', type=float, default=1e-5, help="Learning rate for post_fc layer")
+    parser.add_argument('--lr-head', type=float, default=1e-3, help="Learning rate for MLP classifier head")
+    parser.add_argument('--mmd-lambda', type=float, default=0.15, help="Weight for the MMD loss")
     parser.add_argument('--epochs', type=int, default=15, help="Number of training epochs")
-    parser.add_argument('--data-dir', type=str, default=r'E:\SleepApneaProcessed', help="Directory with processed .pt files")
+    parser.add_argument('--data-dir', type=str, default=r'E:\SleepApneaProcessed', help="Directory with processed .pt files (source)")
+    parser.add_argument('--target-data-dir', type=str, default=r'E:\SleepApneaProcessed', help="Directory with processed .pt files (target)")
     parser.add_argument('--tsv-path', type=str, default=r'E:\SleepApnea\participants.tsv', help="Path to BIDS participants.tsv")
     parser.add_argument('--weights-path', type=str, default=r'E:\SleepApnea\SleepApneaSSL\stft_pretrained_encoder.pth', help="Path to pretrained encoder weights")
     parser.add_argument('--checkpoint-path', type=str, default=r'E:\SleepApnea\SleepApneaSSL\best_downstream_model.pth', help="Path to save the best model")
@@ -465,7 +506,7 @@ def main():
     loss_type = args.loss_type
 
     # Training hyperparameters
-    base_lr    = args.lr
+
     num_epochs = args.epochs
 
     # -----------------------------------------------------------------------
@@ -524,7 +565,7 @@ def main():
     criterion = _select_criterion(loss_type, num_healthy, num_osa)
 
     # -----------------------------------------------------------------------
-    # 5. Data Loaders (no online augmentations — clean STFT patterns)
+    # 5. Data Loaders
     # -----------------------------------------------------------------------
     train_loader = DataLoader(
         LabeledStreamingDataset(train_files, label_map, is_train=True),
@@ -534,6 +575,17 @@ def main():
         LabeledStreamingDataset(test_files, label_map, is_train=False),
         batch_size=128, shuffle=False
     )
+    
+    # Target Dataloader for Sleep-EDF
+    target_files = glob.glob(os.path.join(args.target_data_dir, '*.pt'))
+    # Use a dummy label map since labels aren't used for MMD
+    dummy_label_map = {int(re.findall(r'\d+', os.path.basename(f))[0]): 0.0 for f in target_files if re.findall(r'\d+', os.path.basename(f))}
+    target_loader = DataLoader(
+        LabeledStreamingDataset(target_files, dummy_label_map, is_train=True),
+        batch_size=128, shuffle=False
+    )
+    
+    mmd_criterion = GaussianMMDLoss(kernel_mul=2.0, kernel_num=5)
 
     # -----------------------------------------------------------------------
     # 6. Model & Optimizer (mode-aware)
@@ -550,14 +602,14 @@ def main():
     model = SleepApneaClassifier(encoder, embed_dim=128, finetune_mode=finetune_mode).to(device)
 
     if finetune_mode == 'layerwise':
-        param_groups = model.get_layerwise_param_groups(base_lr)
+        param_groups = model.get_layerwise_param_groups(args.lr_conv, args.lr_post_fc, args.lr_head)
         optimizer = optim.AdamW(param_groups, weight_decay=1e-4)
         for pg in param_groups:
             print(f"  [{pg.get('name', '?')}] LR: {pg['lr']:.2e} | Params: {sum(p.numel() for p in pg['params']):,}")
     elif finetune_mode == 'full':
-        optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-4)
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr_head, weight_decay=1e-4)
     else:  # frozen
-        optimizer = optim.AdamW(model.classifier.parameters(), lr=base_lr, weight_decay=1e-4)
+        optimizer = optim.AdamW(model.classifier.parameters(), lr=args.lr_head, weight_decay=1e-4)
 
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-5)
 
@@ -571,9 +623,9 @@ def main():
     best_auc = 0.0
 
     for epoch in range(1, num_epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"\nEpoch {epoch:02d}/{num_epochs:02d} | Train Loss: {train_loss:.4f} | LR: {current_lr:.2e}")
+        t_task, t_mmd, t_total = train_one_epoch(model, train_loader, target_loader, optimizer, criterion, mmd_criterion, args.mmd_lambda, device)
+        current_lr = optimizer.param_groups[-1]['lr'] # Get head LR
+        print(f"\nEpoch {epoch:02d}/{num_epochs:02d} | Task Loss: {t_task:.4f} | MMD Loss: {t_mmd:.4f} | Total Loss: {t_total:.4f} | Head LR: {current_lr:.2e}")
 
         acc, sens, spec, f1, auc = evaluate(model, test_loader, device)
         scheduler.step()

@@ -149,12 +149,20 @@ class SleepApneaClassifier(nn.Module):
         - ``layerwise`` : Encoder gradually unfrozen with discriminative LR.
         - ``full``      : All parameters trainable at a single LR.
     """
-    VALID_MODES = ('frozen', 'layerwise', 'full')
+    VALID_MODES = ('frozen', 'head_only', 'layerwise', 'full')
+
+    # ── mode descriptions (printed on init) ─────────────────────────────────
+    _MODE_DESC = {
+        'frozen':    'FROZEN       — encoder fully frozen (params + BN stats)',
+        'head_only': 'HEAD-ONLY    — alias for frozen; only MLP head trains',
+        'layerwise': 'LAYERWISE    — conv frozen, encoder.fc + head train at discriminative LRs',
+        'full':      'FULL         — all parameters train at a single LR',
+    }
 
     def __init__(self, encoder, embed_dim=128, finetune_mode='frozen'):
         super().__init__()
         self.encoder = encoder
-        self._finetune_mode = None  # Will be set by set_finetune_mode()
+        self._finetune_mode = None
 
         # 2-layer MLP projection head (always trainable)
         self.classifier = nn.Sequential(
@@ -165,37 +173,44 @@ class SleepApneaClassifier(nn.Module):
             nn.Linear(128, 1)
         )
 
-        # Apply initial finetune mode
         self.set_finetune_mode(finetune_mode)
 
     def set_finetune_mode(self, mode: str):
         """
-        Configure which parameters are trainable.
+        Configure trainable parameters.
 
-        Parameters
-        ----------
-        mode : str
-            One of 'frozen', 'layerwise', 'full'.
+        Modes
+        -----
+        frozen / head_only : encoder params frozen + BN stats frozen.
+        layerwise          : conv_blocks frozen; encoder.fc + classifier train
+                             at discriminative LRs via get_layerwise_param_groups().
+        full               : all params train at single LR.
         """
         if mode not in self.VALID_MODES:
             raise ValueError(f"finetune_mode must be one of {self.VALID_MODES}, got '{mode}'")
 
         self._finetune_mode = mode
+        print(f"[+] Finetune mode: {self._MODE_DESC[mode]}")
 
-        if mode == 'frozen':
-            print("[+] Finetune mode: FROZEN — encoder weights permanently fixed.")
+        if mode in ('frozen', 'head_only'):
             for param in self.encoder.parameters():
                 param.requires_grad = False
+            # Put encoder in eval so BN running stats stay frozen
+            self.encoder.eval()
 
         elif mode == 'layerwise':
-            print("[+] Finetune mode: LAYERWISE — encoder unfrozen with discriminative LR.")
+            # Freeze conv_blocks; unfreeze fc
+            for name, param in self.encoder.named_parameters():
+                param.requires_grad = ('fc' in name)
+
+        elif mode == 'full':
             for param in self.encoder.parameters():
                 param.requires_grad = True
 
-        elif mode == 'full':
-            print("[+] Finetune mode: FULL — all parameters trainable at single LR.")
-            for param in self.encoder.parameters():
-                param.requires_grad = True
+        # Print trainable summary
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total     = sum(p.numel() for p in self.parameters())
+        print(f"    Trainable: {trainable:,} / {total:,} params")
 
     def get_layerwise_param_groups(self, lr_conv: float, lr_fc: float, lr_head: float):
         """
@@ -223,24 +238,26 @@ class SleepApneaClassifier(nn.Module):
         return groups
         
     def forward_with_features(self, x):
-        if self._finetune_mode == 'frozen':
+        """Returns (post_gelu_embedding, logit).
+        Embedding is hooked after GELU, strictly before Dropout, for stable MMD.
+        Frozen encoder is always run in eval() mode to prevent BN stat updates.
+        """
+        if self._finetune_mode in ('frozen', 'head_only'):
+            self.encoder.eval()          # FIX 3.2: guarantee BN frozen
             with torch.no_grad():
                 features = self.encoder(x)
         else:
             features = self.encoder(x)
-            
-        # Hook post-fc embeddings after GELU, strictly before Dropout
+
+        # classifier: [Linear(128), BN1d(128), GELU, Dropout(0.3), Linear(1)]
         h = features
-        for i in range(3): # Linear -> BatchNorm -> GELU
+        for i in range(3):  # Linear → BN → GELU
             h = self.classifier[i](h)
-            
-        post_fc_embed = h
-        
-        for i in range(3, len(self.classifier)): # Dropout -> Linear
+        post_gelu_embed = h   # shape (B, 128) — stable for MMD
+        for i in range(3, len(self.classifier)):  # Dropout → Linear
             h = self.classifier[i](h)
-            
         logits = h.view(-1)
-        return post_fc_embed, logits
+        return post_gelu_embed, logits
 
     def forward(self, x):
         _, logits = self.forward_with_features(x)
@@ -472,8 +489,9 @@ def _select_criterion(loss_type: str, num_healthy: int, num_osa: int):
 
 def main():
     parser = argparse.ArgumentParser(description="Downstream Fine-Tuning for Sleep Apnea Classification")
-    parser.add_argument('--finetune-mode', type=str, default='frozen', choices=['frozen', 'layerwise', 'full'],
-                        help="Fine-tuning mode: 'frozen', 'layerwise', or 'full'")
+    parser.add_argument('--finetune-mode', type=str, default='frozen',
+                        choices=['frozen', 'head_only', 'layerwise', 'full'],
+                        help="Fine-tuning mode")
     parser.add_argument('--loss-type', type=str, default='focal', choices=['focal', 'weighted_bce'],
                         help="Loss type: 'focal' or 'weighted_bce'")
     parser.add_argument('--lr-conv', type=float, default=1e-5, help="Base learning rate for conv block")
@@ -576,15 +594,32 @@ def main():
         batch_size=128, shuffle=False
     )
     
-    # Target Dataloader for Sleep-EDF
+    # ── FIX 3.4: MMD source == target guard ─────────────────────────────────
     target_files = glob.glob(os.path.join(args.target_data_dir, '*.pt'))
-    # Use a dummy label map since labels aren't used for MMD
-    dummy_label_map = {int(re.findall(r'\d+', os.path.basename(f))[0]): 0.0 for f in target_files if re.findall(r'\d+', os.path.basename(f))}
+    src_norm = os.path.normpath(args.data_dir)
+    tgt_norm = os.path.normpath(args.target_data_dir)
+    mmd_is_domain_adaptation = src_norm != tgt_norm
+    if not mmd_is_domain_adaptation:
+        print("[!] WARNING: --target-data-dir == --data-dir.")
+        print("    MMD is operating on the SOURCE domain only — this is NOT domain adaptation.")
+        print("    Use --target-data-dir to point at a different cohort (e.g. Sleep-EDF .pt files).")
+    else:
+        print(f"[i] MMD domain adaptation: {src_norm} --> {tgt_norm}")
+
+    # Also warn if encoder is frozen (MMD cannot update encoder params)
+    if args.finetune_mode in ('frozen', 'head_only') and mmd_is_domain_adaptation:
+        print("[!] WARNING: encoder is frozen — MMD gradient cannot reach encoder parameters.")
+        print("    MMD will only align the classifier head features, not the encoder representations.")
+        print("    Use --finetune-mode layerwise or full for true encoder-level domain adaptation.")
+
+    dummy_label_map = {
+        int(re.findall(r'\d+', os.path.basename(f))[0]): 0.0
+        for f in target_files if re.findall(r'\d+', os.path.basename(f))
+    }
     target_loader = DataLoader(
         LabeledStreamingDataset(target_files, dummy_label_map, is_train=True),
         batch_size=128, shuffle=False
     )
-    
     mmd_criterion = GaussianMMDLoss(kernel_mul=2.0, kernel_num=5)
 
     # -----------------------------------------------------------------------

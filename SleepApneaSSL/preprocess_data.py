@@ -1,6 +1,8 @@
 import os
 import torch
 import numpy as np
+import math
+from scipy.signal import resample_poly
 import edfio
 from mne_bids import BIDSPath
 import gc
@@ -47,11 +49,13 @@ def preprocess_dataset_memory_safe():
                 print(f"❌ Failed sub-{sub}: No target channels found.")
                 continue
                 
-            # Assume all chosen EEG channels share the main sampling rate
-            # (edfio stores physical data as float64 natively)
+            # --- ANTI-ALIASED RESAMPLING (scipy.signal.resample_poly) ---
+            # DO NOT use slice-decimation (chunk[:, ::factor]) — it aliases.
             sfreq = edf.signals[picks[0]].sampling_frequency
             total_duration = len(edf.signals[picks[0]].data) / sfreq
-            downsample_factor = max(1, int(round(sfreq / target_sfreq)))
+            g = math.gcd(int(sfreq), int(target_sfreq))
+            up   = int(target_sfreq) // g
+            down = int(sfreq) // g
             
             processed_chunks = []
             current_time = 0.0
@@ -66,9 +70,9 @@ def preprocess_dataset_memory_safe():
                 # Extract chunk directly from the edfio signal objects
                 chunk_data = np.array([edf.signals[idx].data[start_idx:stop_idx] for idx in picks])
                 
-                # Numpy decimation
-                if downsample_factor > 1:
-                    chunk_data = chunk_data[:, ::downsample_factor]
+                # Proper anti-aliased resampling via polyphase filter
+                if up != down:  # only resample if rates differ
+                    chunk_data = resample_poly(chunk_data, up, down, axis=1).astype(np.float32)
                 
                 processed_chunks.append(chunk_data)
                 current_time += chunk_duration_sec

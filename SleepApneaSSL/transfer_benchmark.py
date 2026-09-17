@@ -123,18 +123,18 @@ def main():
     available_pids = list(available_pids)
     available_labels = [label_map[pid] for pid in available_pids]
     
-    # Fixed Train/Test Split
-    train_ids_list, test_ids_list = train_test_split(
+    # Fixed TrainVal/Test Split (80/20)
+    trainval_ids, test_ids = train_test_split(
         available_pids, test_size=0.2, stratify=available_labels, random_state=42
     )
     
-    test_files = [pid_to_file[pid] for pid in test_ids_list]
+    test_files = [pid_to_file[pid] for pid in test_ids]
     test_loader = DataLoader(
         LabeledStreamingDataset(test_files, label_map, is_train=False),
         batch_size=128, shuffle=False
     )
     
-    print(f"\n[+] Baseline Test Set: {len(test_ids_list)} patients")
+    print(f"\n[+] Baseline Test Set: {len(test_ids)} patients")
     
     # 2. Benchmark fractions
     fractions = [0.01, 0.05, 0.10, 1.0]
@@ -151,17 +151,36 @@ def main():
     for frac in fractions:
         print(f"\n--- Training on {frac * 100:.0f}% of Source Data ---")
         
-        # Subsetting
-        subset_ids = get_few_shot_subset(train_ids_list, label_map, frac, seed=123)
-        train_files = [pid_to_file[pid] for pid in subset_ids]
+        # Subsetting for few-shot Train/Val
+        subset_ids = get_few_shot_subset(trainval_ids, label_map, frac, seed=123)
+        subset_ids = list(subset_ids)
+        subset_labels = [label_map[p] for p in subset_ids]
         
-        total_train_patients = len(subset_ids)
-        osa_count = sum(1 for pid in subset_ids if label_map[pid] == 1.0)
-        ctrl_count = sum(1 for pid in subset_ids if label_map[pid] == 0.0)
-        print(f"[i] Few-Shot Subset: {total_train_patients} patients (OSA: {osa_count} | Control: {ctrl_count})")
+        # Split subset into train and validation (90/10 of subset if enough, else 50/50, or just use train if too small)
+        if len(subset_ids) > 4:
+            try:
+                train_ids, val_ids = train_test_split(subset_ids, test_size=0.15, stratify=subset_labels, random_state=123)
+            except:
+                train_ids, val_ids = train_test_split(subset_ids, test_size=0.25, random_state=123)
+        else:
+            train_ids = subset_ids
+            val_ids = subset_ids  # Fallback for extremely small 1% sets
+
+        train_files = [pid_to_file[pid] for pid in train_ids]
+        val_files = [pid_to_file[pid] for pid in val_ids]
+        
+        total_train_patients = len(train_ids)
+        osa_count = sum(1 for pid in train_ids if label_map[pid] == 1.0)
+        ctrl_count = sum(1 for pid in train_ids if label_map[pid] == 0.0)
+        print(f"[i] Few-Shot Train: {total_train_patients} patients (OSA: {osa_count} | Control: {ctrl_count})")
+        print(f"[i] Few-Shot Val: {len(val_ids)} patients")
         
         train_loader = DataLoader(
             LabeledStreamingDataset(train_files, label_map, is_train=True),
+            batch_size=128, shuffle=False
+        )
+        val_loader = DataLoader(
+            LabeledStreamingDataset(val_files, label_map, is_train=False),
             batch_size=128, shuffle=False
         )
         
@@ -180,9 +199,8 @@ def main():
         # Only optimise the classifier MLP head
         optimizer = optim.AdamW(model.classifier.parameters(), lr=1e-3, weight_decay=1e-4)
         
-        best_pat_auc = 0.0
-        best_pat_acc = 0.0
-        best_win_auc = 0.0
+        best_val_auc = 0.0
+        best_model_state = None
         
         # Training Loop
         for epoch in range(1, epochs + 1):
@@ -207,26 +225,30 @@ def main():
                 
             train_loss = total_loss / max(1, count)
             
-            # Evaluate
-            win_auc, pat_auc, pat_acc = evaluate_benchmark(model, test_loader, device)
+            # Evaluate on Validation Set for Model Selection
+            _, val_auc, _ = evaluate_benchmark(model, val_loader, device)
             
-            if pat_auc > best_pat_auc:
-                best_pat_auc = pat_auc
-                best_pat_acc = pat_acc
-                best_win_auc = win_auc
+            if val_auc >= best_val_auc:
+                best_val_auc = val_auc
+                best_model_state = {k: v.cpu() for k, v in model.state_dict().items()}
                 
-            print(f"  Epoch {epoch:02d}/{epochs:02d} | Train Loss: {train_loss:.4f} | "
-                  f"Test Pat-AUC: {pat_auc:.4f} | Test Pat-Acc: {pat_acc:.4f}")
+            print(f"  Epoch {epoch:02d}/{epochs:02d} | Train Loss: {train_loss:.4f} | Val Pat-AUC: {val_auc:.4f}")
+
+        # Final Evaluation on Held-out Test Set
+        if best_model_state is not None:
+            model.load_state_dict({k: v.to(device) for k, v in best_model_state.items()})
+        
+        test_win_auc, test_pat_auc, test_pat_acc = evaluate_benchmark(model, test_loader, device)
             
-        print(f">>> {frac * 100:.0f}% Data Benchmark Complete | Best Pat-AUC: {best_pat_auc:.4f}")
+        print(f">>> {frac * 100:.0f}% Data Benchmark Complete | Test Pat-AUC: {test_pat_auc:.4f} (Val-selected)")
         
         # Save results
         results.append({
             'Fraction': frac,
             'Train_Patients': total_train_patients,
-            'Window_AUC': best_win_auc,
-            'Patient_AUC': best_pat_auc,
-            'Patient_Acc': best_pat_acc
+            'Window_AUC': test_win_auc,
+            'Patient_AUC': test_pat_auc,
+            'Patient_Acc': test_pat_acc
         })
         
     # Generate Output

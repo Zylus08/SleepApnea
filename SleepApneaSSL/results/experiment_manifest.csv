@@ -1,0 +1,12 @@
+Experiment ID,Model,Loss,Dataset,Split,Seed,Config,Metrics file,Checkpoint,Figure,Status,Notes
+A0_VanillaNTXent,STFTEncoder2D,VanillaNTXentLoss,ds008108,60/20/20 subject,42,experiments/loss_ablation.py,results/loss_ablation/A0_VanillaNTXent_metrics.json,results/loss_ablation/encoder_A0_VanillaNTXent.pth,,RUNNING,SSL=5ep DS=8ep
+A1_TemporalNTXent,STFTEncoder2D,TemporalNTXentLoss,ds008108,60/20/20 subject,42,experiments/loss_ablation.py,results/loss_ablation/A1_TemporalNTXent_metrics.json,results/loss_ablation/encoder_A1_TemporalNTXent.pth,,RUNNING,lambda_decay=0.1
+A2_NTXent_TempReg,STFTEncoder2D,NT-Xent+TempReg,ds008108,60/20/20 subject,42,experiments/loss_ablation.py,results/loss_ablation/A2_NTXent_TempReg_metrics.json,results/loss_ablation/encoder_A2_NTXent_TempReg.pth,,RUNNING,lambda_temporal=0.15
+A3_PhysioCLR,STFTEncoder2D,PhysioCLRLoss,ds008108,60/20/20 subject,42,experiments/loss_ablation.py,results/loss_ablation/A3_PhysioCLR_metrics.json,results/loss_ablation/encoder_A3_PhysioCLR.pth,,RUNNING,temp=0.07 lambda=0.15
+FEW_SHOT_BENCHMARK,STFTEncoder2D,FocalLoss,ds008108,80/20 patient-level,42,transfer_benchmark.py,transfer_results.csv,best_downstream_model.pth,few_shot_curve.png,COMPLETED(LEAKY),Test-AUC checkpoint selection — results INVALID
+CROSS_COHORT_EVAL,STFTEncoder2D+MLP,FocalLoss,Sleep-EDF,external,42,cross_cohort_eval.py,cross_cohort_results.npz,best_downstream_model.pth,prediction_distribution.png,COMPLETED,Single ch repeated 20x — NOT valid montage
+MIL_TRAIN,AttentionMIL+STFTEncoder2D,CE,ds008108,80/20 patient,42,mil_train.py,,mil_checkpoint.pth,,COMPLETED,Patient-level bag training
+SSL_STFT_PRETRAIN,STFTEncoder2D,PhysioCLRLoss,ds008108,train-only SSL,42,simclr_train_2d.py,,stft_pretrained_encoder.pth,,COMPLETED,15 epochs
+SSL_EEG_PRETRAIN,EEGEncoder,TemporalNTXentLoss,ds008108,all subjects,42,train.py,,iclr_pretrained_encoder.pth,,COMPLETED,20 epochs - Gen 1
+DOWNSTREAM_FROZEN,STFTEncoder2D+MLP,FocalLoss,ds008108,80/20 patient,42,downstream_finetune.py,,best_downstream_model.pth,,COMPLETED,alpha=0.55 gamma=1.0
+ONNX_DEPLOY,STFTEncoder2D+MLP,N/A,N/A,N/A,N/A,edge_benchmark.py,,sleep_apnea_fp32.onnx+sleep_apnea_int8.onnx,,COMPLETED,opset17 precomputed-spec input NOT raw EEG

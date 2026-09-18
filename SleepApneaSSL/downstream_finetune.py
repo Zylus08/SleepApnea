@@ -164,7 +164,6 @@ class SleepApneaClassifier(nn.Module):
         self.encoder = encoder
         self._finetune_mode = None
 
-        # 2-layer MLP projection head (always trainable)
         self.classifier = nn.Sequential(
             nn.Linear(embed_dim, 128),
             nn.BatchNorm1d(128),
@@ -174,6 +173,13 @@ class SleepApneaClassifier(nn.Module):
         )
 
         self.set_finetune_mode(finetune_mode)
+
+    def train(self, mode=True):
+        super().train(mode)
+        if getattr(self, '_finetune_mode', None) in ('frozen', 'head_only'):
+            if hasattr(self, 'encoder'):
+                self.encoder.eval()
+        return self
 
     def set_finetune_mode(self, mode: str):
         """

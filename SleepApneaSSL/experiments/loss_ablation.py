@@ -50,6 +50,9 @@ class SSLStreamingDataset(IterableDataset):
     def __iter__(self):
         flist = list(self.files); random.shuffle(flist)
         for f in flist:
+            pid_match = re.findall(r'\d+', os.path.basename(f))
+            pid = int(pid_match[0]) if pid_match else 0
+            
             bag = torch.load(f, map_location='cpu', weights_only=True)
             if isinstance(bag, torch.Tensor) and bag.dim() == 2 and bag.shape[0] == 20:
                 n_win = bag.shape[1] // 3000
@@ -59,7 +62,7 @@ class SSLStreamingDataset(IterableDataset):
             n_win = bag.shape[0]
             for w in range(n_win):
                 is_boundary = int(w == 0)
-                yield bag[w].float(), torch.tensor(w, dtype=torch.long), torch.tensor(is_boundary)
+                yield bag[w].float(), torch.tensor(pid, dtype=torch.long), torch.tensor(w, dtype=torch.long), torch.tensor(is_boundary)
             del bag; gc.collect()
 
 # ── Vanilla NT-Xent ──────────────────────────────────────────────────────────
@@ -85,15 +88,21 @@ class NTXentPlusTempReg(nn.Module):
         l_nt = self.ntxent(z_i, z_j)
         # temporal continuity on z_i
         z_n = F.normalize(z_i, dim=1)
-        if is_boundary is not None:
+        l_temp = z_n.new_tensor(0.)
+        if sub_ids is not None and time_idx is not None:
             B = z_n.shape[0]
-            if B < 2: return l_nt, {'loss_contrastive': l_nt.item(), 'loss_temporal': 0.0}
-            valid = (1.0 - is_boundary[1:].float())
-            mse = F.mse_loss(z_n[:-1], z_n[1:], reduction='none').mean(1)
-            n_valid = valid.sum()
-            l_temp = (mse * valid).sum() / n_valid if n_valid > 0 else z_n.new_tensor(0.)
-        else:
-            l_temp = z_n.new_tensor(0.)
+            if B >= 2:
+                # Find valid temporally adjacent pairs within the batch
+                same_sub = (sub_ids.unsqueeze(1) == sub_ids.unsqueeze(0))
+                time_next = (time_idx.unsqueeze(1) == time_idx.unsqueeze(0) + 1)
+                valid_mask = same_sub & time_next
+                
+                diff = z_n.unsqueeze(1) - z_n.unsqueeze(0)  # (B, B, D)
+                mse_dist = diff.pow(2).mean(dim=-1)         # (B, B)
+                
+                n_valid = valid_mask.sum()
+                if n_valid > 0:
+                    l_temp = (mse_dist * valid_mask).sum() / n_valid
         total = l_nt + self.lam * l_temp
         return total, {'loss_contrastive': l_nt.item(), 'loss_temporal': l_temp.item() if isinstance(l_temp, torch.Tensor) else l_temp}
 
@@ -132,11 +141,11 @@ def pretrain_ssl(loss_name, loss_fn, ssl_files, device, out_path):
     for epoch in range(1, SSL_EPOCHS+1):
         model.train(); masker.train()
         ep_loss = ep_cont = ep_temp = 0.; n = 0
-        for x, time_idx, is_boundary in loader:
+        for x, sub_ids, time_idx, is_boundary in loader:
             x = x.to(device)
-            is_boundary = is_boundary.to(device)
-            sub_ids = torch.zeros(x.shape[0], dtype=torch.long, device=device)  # single cohort
+            sub_ids = sub_ids.to(device)
             time_idx = time_idx.to(device)
+            is_boundary = is_boundary.to(device)
 
             with torch.no_grad():
                 specs = model.encoder.stft(x)
@@ -172,49 +181,320 @@ def pretrain_ssl(loss_name, loss_fn, ssl_files, device, out_path):
 
 # ── Downstream evaluation ─────────────────────────────────────────────────────
 @torch.no_grad()
-def evaluate_downstream(model, loader, device):
+def evaluate_downstream(model, loader, device, return_raw=False):
+    """
+    Evaluate downstream classifier at the PATIENT level.
+
+    Each patient's window-level probabilities are averaged first,
+    and AUROC/AUPRC are then computed across patients.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Trained downstream model.
+    loader : DataLoader
+        Evaluation DataLoader yielding (x, y, pid).
+    device : torch.device
+        Evaluation device.
+    return_raw : bool, default=False
+        If False:
+            Returns {'auroc': ..., 'auprc': ...}
+
+        If True:
+            Returns (patient_ids, targets, probabilities)
+
+    Returns
+    -------
+    dict OR tuple
+        Patient-level metrics, or raw patient-level predictions.
+    """
+
     model.eval()
-    pat_probs = {}; pat_targets = {}
-    for x, y, pids in loader:
-        x = x.to(device)
-        logits = model(x)
-        probs = torch.sigmoid(logits).cpu().numpy()
-        for prob, lbl, pid in zip(probs, y.numpy(), pids.numpy()):
-            pid = int(pid)
-            pat_probs.setdefault(pid, []).append(float(prob))
-            pat_targets[pid] = float(lbl)
-    pat_ids = list(pat_probs)
-    pp = np.array([np.mean(pat_probs[p]) for p in pat_ids])
-    pt = np.array([pat_targets[p] for p in pat_ids])
-    if len(set(pt)) < 2:
-        return {'auroc': float('nan'), 'auprc': float('nan')}
-    return {'auroc': roc_auc_score(pt, pp), 'auprc': average_precision_score(pt, pp)}
 
-def finetune_downstream(encoder_path, label_map, train_files, val_files, test_files, device):
-    encoder = STFTEncoder2D(in_channels=20, embed_dim=128)
-    if os.path.exists(encoder_path):
-        encoder.load_state_dict(torch.load(encoder_path, map_location='cpu', weights_only=True))
-    model = SleepApneaClassifier(encoder, finetune_mode='frozen').to(device)
-    optimizer = optim.AdamW(model.classifier.parameters(), lr=1e-3, weight_decay=1e-4)
-    criterion = BinaryFocalLossWithLogits(alpha=0.55, gamma=1.0)
+    # Collect window-level predictions grouped by patient ID
+    pat_probs = {}
+    pat_targets = {}
 
-    train_loader = DataLoader(LabeledStreamingDataset(train_files, label_map, is_train=True), batch_size=128, shuffle=False)
-    val_loader   = DataLoader(LabeledStreamingDataset(val_files,   label_map, is_train=False), batch_size=128, shuffle=False)
-    test_loader  = DataLoader(LabeledStreamingDataset(test_files,  label_map, is_train=False), batch_size=128, shuffle=False)
+    with torch.no_grad():
+        for x, y, pids in loader:
+            x = x.to(device, non_blocking=True)
 
-    best_val_auc = 0.; best_test_metrics = {}
-    for epoch in range(1, DS_EPOCHS+1):
-        model.train(); model.encoder.eval()
+            logits = model(x)
+            probs = torch.sigmoid(logits).detach().cpu().numpy()
+
+            y_np = y.detach().cpu().numpy()
+            pid_np = pids.detach().cpu().numpy()
+
+            for prob, lbl, pid in zip(probs, y_np, pid_np):
+                pid = int(pid)
+
+                pat_probs.setdefault(pid, []).append(float(prob))
+                pat_targets[pid] = float(lbl)
+
+    # No predictions available
+    if len(pat_probs) == 0:
+        if return_raw:
+            return (
+                np.array([], dtype=np.int64),
+                np.array([], dtype=np.float32),
+                np.array([], dtype=np.float32)
+            )
+
+        return {
+            'auroc': float('nan'),
+            'auprc': float('nan')
+        }
+
+    # Sort patient IDs explicitly for deterministic ordering
+    pat_ids = sorted(pat_probs.keys())
+
+    # Patient-level mean probability
+    patient_probs = np.array(
+        [np.mean(pat_probs[pid]) for pid in pat_ids],
+        dtype=np.float32
+    )
+
+    # Patient-level ground-truth labels
+    patient_targets = np.array(
+        [pat_targets[pid] for pid in pat_ids],
+        dtype=np.float32
+    )
+
+    patient_ids = np.array(
+        pat_ids,
+        dtype=np.int64
+    )
+
+    # Return raw patient-level predictions for bootstrap/statistical analysis
+    if return_raw:
+        return patient_ids, patient_targets, patient_probs
+
+    # Metrics require both classes
+    if len(np.unique(patient_targets)) < 2:
+        return {
+            'auroc': float('nan'),
+            'auprc': float('nan')
+        }
+
+    auroc = roc_auc_score(
+        patient_targets,
+        patient_probs
+    )
+
+    auprc = average_precision_score(
+        patient_targets,
+        patient_probs
+    )
+
+    return {
+        'auroc': float(auroc),
+        'auprc': float(auprc)
+    }
+
+def finetune_downstream(
+    encoder_path,
+    label_map,
+    train_files,
+    val_files,
+    test_files,
+    device,
+    predictions_save_path=None,
+    seed=None
+):
+    """
+    Downstream frozen-encoder evaluation.
+
+    Protocol:
+      1. Explicitly seed downstream training.
+      2. Train classifier on TRAIN patients only.
+      3. Select checkpoint using VALIDATION AUROC only.
+      4. Evaluate TEST exactly once.
+      5. Aggregate window predictions to PATIENT level.
+      6. Save patient IDs, targets, and probabilities.
+    """
+
+    if seed is not None:
+        set_seed(seed)
+
+    # ---------------------------------------------------------
+    # Model
+    # ---------------------------------------------------------
+    encoder = STFTEncoder2D(
+        in_channels=20,
+        embed_dim=128
+    )
+
+    if not os.path.exists(encoder_path):
+        raise FileNotFoundError(
+            f"Encoder checkpoint not found: {encoder_path}"
+        )
+
+    encoder.load_state_dict(
+        torch.load(
+            encoder_path,
+            map_location='cpu',
+            weights_only=True
+        )
+    )
+
+    model = SleepApneaClassifier(
+        encoder,
+        finetune_mode='frozen'
+    ).to(device)
+
+    optimizer = optim.AdamW(
+        model.classifier.parameters(),
+        lr=1e-3,
+        weight_decay=1e-4
+    )
+
+    criterion = BinaryFocalLossWithLogits(
+        alpha=0.55,
+        gamma=1.0
+    )
+
+    # ---------------------------------------------------------
+    # Data
+    # ---------------------------------------------------------
+    train_loader = DataLoader(
+        LabeledStreamingDataset(
+            train_files,
+            label_map,
+            is_train=True
+        ),
+        batch_size=128,
+        shuffle=False
+    )
+
+    val_loader = DataLoader(
+        LabeledStreamingDataset(
+            val_files,
+            label_map,
+            is_train=False
+        ),
+        batch_size=128,
+        shuffle=False
+    )
+
+    test_loader = DataLoader(
+        LabeledStreamingDataset(
+            test_files,
+            label_map,
+            is_train=False
+        ),
+        batch_size=128,
+        shuffle=False
+    )
+
+    # ---------------------------------------------------------
+    # Validation-based model selection
+    # ---------------------------------------------------------
+    best_val_auc = -float('inf')
+    best_model_state = None
+
+    import copy
+
+    for epoch in range(1, DS_EPOCHS + 1):
+
+        model.train()
+
+        # Encoder remains frozen, including BN statistics
+        model.encoder.eval()
+
         for x, y, _ in train_loader:
-            x = x.to(device); y = y.to(device).float().view(-1)
+
+            x = x.to(device, non_blocking=True)
+            y = y.to(device).float().view(-1)
+
             optimizer.zero_grad()
+
             logits = model(x)
             loss = criterion(logits, y)
-            loss.backward(); optimizer.step()
-        val_m = evaluate_downstream(model, val_loader, device)
-        if val_m['auroc'] > best_val_auc:
+
+            loss.backward()
+            optimizer.step()
+
+        # Validation only — never touch test here
+        val_m = evaluate_downstream(
+            model,
+            val_loader,
+            device
+        )
+
+        if (
+            not np.isnan(val_m['auroc'])
+            and val_m['auroc'] > best_val_auc
+        ):
             best_val_auc = val_m['auroc']
-            best_test_metrics = evaluate_downstream(model, test_loader, device)
+            best_model_state = copy.deepcopy(
+                model.state_dict()
+            )
+
+    if best_model_state is None:
+        raise RuntimeError(
+            "No valid validation checkpoint was selected. "
+            "Check validation labels and evaluation pipeline."
+        )
+
+    # ---------------------------------------------------------
+    # FINAL TEST EVALUATION — EXACTLY ONCE
+    # ---------------------------------------------------------
+    model.load_state_dict(best_model_state)
+
+    test_patient_ids, test_targets, test_probs = evaluate_downstream(
+        model,
+        test_loader,
+        device,
+        return_raw=True
+    )
+
+    # ---------------------------------------------------------
+    # Patient-level metrics
+    # ---------------------------------------------------------
+    if len(test_targets) == 0:
+        raise RuntimeError(
+            "Test evaluation returned zero patients."
+        )
+
+    if len(np.unique(test_targets)) < 2:
+        best_test_metrics = {
+            'auroc': float('nan'),
+            'auprc': float('nan')
+        }
+
+    else:
+        best_test_metrics = {
+            'auroc': float(
+                roc_auc_score(
+                    test_targets,
+                    test_probs
+                )
+            ),
+            'auprc': float(
+                average_precision_score(
+                    test_targets,
+                    test_probs
+                )
+            )
+        }
+
+    # ---------------------------------------------------------
+    # Save patient-level predictions
+    # ---------------------------------------------------------
+    if predictions_save_path is not None:
+
+        np.savez(
+            predictions_save_path,
+            patient_ids=test_patient_ids,
+            targets=test_targets,
+            probs=test_probs
+        )
+
+        print(
+            f"  [+] Patient-level predictions saved to "
+            f"{predictions_save_path}"
+        )
+
     return best_test_metrics
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -266,7 +546,9 @@ def main():
         ssl_time = time.time() - t0
 
         t1 = time.time()
-        test_metrics = finetune_downstream(enc_path, label_map, train_files, val_files, test_files, device)
+        pred_path = os.path.join(OUT_DIR, f'{name}_predictions.npz')
+        test_metrics = finetune_downstream(enc_path, label_map, train_files, val_files, test_files, device,
+                                           predictions_save_path=pred_path)
         ds_time = time.time() - t1
 
         row = {

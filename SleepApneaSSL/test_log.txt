@@ -1,0 +1,9 @@
+Starting...
+Imported loss_ablation
+Device: cpu
+Files: ['E:\\SleepApneaProcessed\\sub-001_eeg.pt']
+Starting pretrain_ssl...
+Initialized models and loader
+Iterating loader...
+Got batch in 0.10s. Shape: torch.Size([64, 20, 3000])
+Done test loop.

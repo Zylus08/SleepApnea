@@ -27,7 +27,8 @@ from sklearn.model_selection import train_test_split
 OUT_DIR = r'E:\SleepApnea\SleepApneaSSL\results\multiseed'
 os.makedirs(OUT_DIR, exist_ok=True)
 
-SEEDS = [42, 123, 2025]
+# SEEDS = [42, 123, 2025]
+SEEDS = [7, 13]
 
 def main():
     print("=== MULTI-SEED EXPERIMENT (A0 vs A1) ===")

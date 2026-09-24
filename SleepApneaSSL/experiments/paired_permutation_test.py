@@ -15,7 +15,8 @@ import csv
 import numpy as np
 from sklearn.metrics import roc_auc_score, average_precision_score
 
-SEEDS = [42, 123, 2025]
+# SEEDS = [42, 123, 2025]
+SEEDS = [7, 13]
 N_PERM = 10000
 
 RESULTS_DIR = r'E:\SleepApnea\SleepApneaSSL\results\multiseed'

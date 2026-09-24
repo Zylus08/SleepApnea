@@ -1,0 +1,17 @@
+Device: cpu
+[+] Loading BIDS metadata from 'E:\SleepApnea\participants.tsv'...
+[i] Using Subject ID Column: 'participant_id' | Diagnosis Column: 'group'
+[+] Metadata loaded for 142 subjects -> OSA: 56 | Healthy: 86
+
+>>> Running SoftCLT Seed 42 <<<
+Skipping pretraining, E:\SleepApnea\SleepApneaSSL\results\softclt\seed_42\SoftCLT_encoder.pth already exists
+[+] Finetune mode: FROZEN       � encoder fully frozen (params + BN stats)
+    Trainable: 16,897 / 132,001 params
+  [+] Patient-level predictions saved to E:\SleepApnea\SleepApneaSSL\results\softclt\seed_42\SoftCLT_predictions.npz
+
+=== AGGREGATING RESULTS ===
+SoftCLT AUROC: 0.5583 +- 0.0000 (Median: 0.5583)
+SoftCLT AUPRC: 0.5549 +- 0.0000 (Median: 0.5549)
+Seeds SoftCLT > A0 (AUROC): 1/1
+Seeds SoftCLT > A1 (AUROC): 0/1
+[+] Analysis saved to E:\SleepApnea\SleepApneaSSL\results\softclt\softclt_analysis.json

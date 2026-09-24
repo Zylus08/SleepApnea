@@ -28,7 +28,8 @@ from sklearn.metrics import (
 
 RESULTS_DIR = r'E:\SleepApnea\SleepApneaSSL\results\multiseed'
 
-SEEDS = [42, 123, 2025]
+# SEEDS = [42, 123, 2025]
+SEEDS = [7, 13]
 
 METHODS = {
     'A0': 'A0_VanillaNTXent',

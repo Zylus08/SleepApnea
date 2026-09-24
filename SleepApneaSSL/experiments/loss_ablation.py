@@ -23,7 +23,7 @@ from sklearn.model_selection import train_test_split
 
 from model import STFTEncoder2D, SimCLR, EEGEncoder
 from physio_clr import SpectralSubbandMasking, PhysioCLRLoss
-from temporal_loss import TemporalNTXentLoss
+from temporal_loss import TemporalNTXentLoss, SoftCLTLoss
 from downstream_finetune import (
     load_bids_labels, LabeledStreamingDataset,
     SleepApneaClassifier, BinaryFocalLossWithLogits
@@ -84,7 +84,7 @@ class NTXentPlusTempReg(nn.Module):
         super().__init__()
         self.ntxent = VanillaNTXentLoss(temperature)
         self.lam = lambda_temporal
-    def forward(self, z_i, z_j, sub_ids=None, time_idx=None, is_boundary=None):
+    def forward(self, z_i, z_j, sub_ids=None, time_idx=None, is_boundary=None, x_raw=None):
         l_nt = self.ntxent(z_i, z_j)
         # temporal continuity on z_i
         z_n = F.normalize(z_i, dim=1)
@@ -108,10 +108,23 @@ class NTXentPlusTempReg(nn.Module):
 
 # ── Wrapper to give TemporalNTXentLoss same signature ─────────────────────────
 class TemporalNTXentWrapper(nn.Module):
-    def __init__(self, temperature=0.5, lambda_decay=0.1):
+    def __init__(
+        self, 
+        temperature=0.5, 
+        lambda_decay=0.1,
+        kernel_type='exponential',
+        kernel_alpha=0.1,
+        kernel_cutoff=10.0
+    ):
         super().__init__()
-        self.loss = TemporalNTXentLoss(temperature=temperature, lambda_decay=lambda_decay)
-    def forward(self, z_i, z_j, sub_ids, time_idx, is_boundary=None):
+        self.loss = TemporalNTXentLoss(
+            temperature=temperature, 
+            lambda_decay=lambda_decay,
+            kernel_type=kernel_type,
+            kernel_alpha=kernel_alpha,
+            kernel_cutoff=kernel_cutoff
+        )
+    def forward(self, z_i, z_j, sub_ids, time_idx, is_boundary=None, x_raw=None):
         l = self.loss(z_i, z_j, sub_ids, time_idx)
         return l, {'loss_contrastive': l.item(), 'loss_temporal': 0.0}
 
@@ -120,14 +133,29 @@ class PhysioCLRWrapper(nn.Module):
     def __init__(self, temperature=0.07, lambda_temporal=0.15):
         super().__init__()
         self.loss = PhysioCLRLoss(temperature=temperature, lambda_temporal=lambda_temporal)
-    def forward(self, z_i, z_j, sub_ids=None, time_idx=None, is_boundary=None):
-        if is_boundary is None:
-            is_boundary = torch.zeros(z_i.shape[0], dtype=torch.long, device=z_i.device)
-        return self.loss(z_i, z_j, is_boundary)
+    def forward(self, z_i, z_j, sub_ids=None, time_idx=None, is_boundary=None, x_raw=None):
+        return self.loss(z_i, z_j, sub_ids, time_idx)
+
+# ── SoftCLT wrapper (Lee et al., ICLR 2024) ───────────────────────────────────
+class SoftCLTWrapper(nn.Module):
+    """
+    Wrapper for SoftCLTLoss that follows the same calling convention as
+    all other ablation loss wrappers.
+
+    SoftCLT requires x_raw (raw EEG windows) to compute the inter-instance
+    data-space distance matrix. All other wrappers ignore x_raw.
+    """
+    def __init__(self, temperature=0.5, tau_I=2.0, alpha=0.5):
+        super().__init__()
+        self.loss = SoftCLTLoss(temperature=temperature, tau_I=tau_I, alpha=alpha)
+    def forward(self, z_i, z_j, sub_ids=None, time_idx=None, is_boundary=None, x_raw=None):
+        if x_raw is None:
+            raise ValueError("SoftCLTWrapper requires x_raw (raw EEG windows) to compute distance matrix.")
+        l = self.loss(z_i, z_j, x_raw=x_raw)
+        return l, {'loss_contrastive': l.item(), 'loss_temporal': 0.0}
 
 # ── SSL pretraining ───────────────────────────────────────────────────────────
 def pretrain_ssl(loss_name, loss_fn, ssl_files, device, out_path):
-    set_seed(SEED)
     encoder = STFTEncoder2D(in_channels=20, embed_dim=128).to(device)
     model = SimCLR(encoder, projection_dim=64).to(device)
     masker = SpectralSubbandMasking(p=0.5).to(device)
@@ -156,7 +184,8 @@ def pretrain_ssl(loss_name, loss_fn, ssl_files, device, out_path):
             with ctx:
                 _, z1 = model(s1, input_is_spec=True)
                 _, z2 = model(s2, input_is_spec=True)
-                out = loss_fn(z1, z2, sub_ids, time_idx, is_boundary)
+                # SoftCLTWrapper needs x_raw; all other wrappers ignore it
+                out = loss_fn(z1, z2, sub_ids, time_idx, is_boundary, x_raw=x)
                 if isinstance(out, tuple):
                     loss, metrics = out
                 else:

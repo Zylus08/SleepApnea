@@ -43,12 +43,23 @@ class TemporalNTXentLoss(nn.Module):
             w_same = 1 - exp(-λ * |t_i - t_j|)
             At λ=0.1: Δt=1 → w≈0.095, Δt=10 → w≈0.632, Δt=50 → w≈0.993
     """
-    def __init__(self, temperature: float = 0.5, lambda_decay: float = 0.1):
+    def __init__(
+        self, 
+        temperature: float = 0.5, 
+        lambda_decay: float = 0.1,
+        kernel_type: str = 'exponential',
+        kernel_alpha: float = 0.1,
+        kernel_cutoff: float = 10.0
+    ):
         super().__init__()
         assert temperature > 0, "temperature must be positive"
         assert lambda_decay >= 0, "lambda_decay must be non-negative"
+        assert kernel_type in ['exponential', 'linear', 'cutoff'], f"Invalid kernel: {kernel_type}"
         self.temperature = temperature
         self.lambda_decay = lambda_decay
+        self.kernel_type = kernel_type
+        self.kernel_alpha = kernel_alpha
+        self.kernel_cutoff = kernel_cutoff
 
     def forward(
         self,
@@ -102,7 +113,12 @@ class TemporalNTXentLoss(nn.Module):
         time_dist = torch.abs(time_2n.unsqueeze(0) - time_2n.unsqueeze(1))  # (2N, 2N)
 
         # Same-subject temporal weight: 0 at Δt=0, approaches 1 as Δt→∞
-        w_same = 1.0 - torch.exp(-self.lambda_decay * time_dist)
+        if self.kernel_type == 'exponential':
+            w_same = 1.0 - torch.exp(-self.lambda_decay * time_dist)
+        elif self.kernel_type == 'linear':
+            w_same = torch.clamp(self.kernel_alpha * time_dist, min=0.0, max=1.0)
+        elif self.kernel_type == 'cutoff':
+            w_same = (time_dist > self.kernel_cutoff).float()
         # Cross-subject weight: always 1
         temporal_weights = torch.where(same_sub, w_same, torch.ones_like(w_same))
 
@@ -213,3 +229,209 @@ def unit_test():
 
 if __name__ == '__main__':
     unit_test()
+
+
+# ==============================================================================
+# SoftCLTLoss
+# ==============================================================================
+# Faithful adaptation of Soft Instance-Wise Contrastive Loss from:
+#   Lee et al., "Soft Contrastive Learning for Time Series", ICLR 2024
+#   arXiv:2312.16424
+#
+# Paper equations adapted to our window-level EEG setting:
+#
+# Soft assignment for pair (i, i'):
+#   w_I(i, i') = α * σ(-(D_norm(x_i, x_i') - 1) / τ_I)   if i ≠ i'  (Eq. 1)
+#   w_I(i, i') = 1                                          if i = i'  (positive pair)
+#
+# where D_norm is the min-max normalized pairwise Euclidean distance
+# between raw EEG windows, computed per-batch.
+#
+# For each anchor i, the soft loss is:
+#   ℓ_I(i) = -log p_I(i) - Σ_{i'≠i} w_I(i,i') * log p_I(i')     (Eq. 3)
+#
+# where p_I(i') = exp(z_i ∘ z_j) / Σ_k exp(z_i ∘ z_k)
+#
+# The POSITIVE IS INCLUDED in the denominator (matching reference code convention).
+#
+# Temporal Contrastive Loss (TS2Vec-style, Eq. 4-6) is NOT implemented here.
+# It requires per-timestamp embeddings from a hierarchical encoder, which is
+# incompatible with our window-level STFTEncoder2D architecture.
+# See SOFTCLT_FORMULATION_AUDIT.md for full justification.
+# ==============================================================================
+
+class SoftCLTLoss(nn.Module):
+    """
+    Soft Instance-Wise Contrastive Loss (Lee et al., ICLR 2024).
+
+    Implements only the instance-wise component (Eq. 1-3) adapted to
+    window-level EEG contrastive learning. The temporal contrastive component
+    (Eq. 4-6) requires a hierarchical per-timestamp architecture (TS2Vec) and
+    cannot be faithfully applied to our STFTEncoder2D.
+
+    Args:
+        temperature (float): Contrastive temperature τ. Default 0.5
+            (consistent with A0/A1/A2 in this codebase).
+        tau_I (float): Sharpness for soft assignment. Paper default: 2.
+        alpha (float): Upper-bound for non-self-pair assignments. Paper
+            ablation Table 5c chooses α=0.5 as best.
+    """
+    def __init__(self, temperature: float = 0.5, tau_I: float = 2.0, alpha: float = 0.5):
+        super().__init__()
+        self.temperature = temperature
+        self.tau_I = tau_I
+        self.alpha = alpha
+
+    @staticmethod
+    def _pairwise_euclidean_minmax(x_raw: torch.Tensor) -> torch.Tensor:
+        """
+        Computes pairwise Euclidean distance matrix for a batch of raw EEG windows,
+        then min-max normalizes to [0, 1].
+
+        Args:
+            x_raw: (N, C, T) raw EEG windows
+
+        Returns:
+            D_norm: (N, N) distance matrix, values in [0, 1]
+        """
+        N = x_raw.shape[0]
+        x_flat = x_raw.reshape(N, -1).float()   # (N, C*T)
+
+        # Squared Euclidean distances via broadcasting
+        # ||a - b||^2 = ||a||^2 + ||b||^2 - 2<a,b>
+        dot = torch.mm(x_flat, x_flat.t())      # (N, N)
+        sq = (x_flat * x_flat).sum(dim=1)       # (N,)
+        dist_sq = sq.unsqueeze(1) + sq.unsqueeze(0) - 2.0 * dot
+        dist_sq = dist_sq.clamp(min=0.0)        # numerical safety
+        dist = dist_sq.sqrt()                   # (N, N)
+
+        # Min-max normalization per Lee et al. (excludes diagonal)
+        # Use off-diagonal values for normalization range
+        mask_diag = ~torch.eye(N, dtype=torch.bool, device=x_raw.device)
+        off_diag = dist[mask_diag]
+        d_min = off_diag.min()
+        d_max = off_diag.max()
+        if d_max > d_min:
+            D_norm = (dist - d_min) / (d_max - d_min)
+            D_norm = D_norm.clamp(min=0.0, max=1.0)  # diagonal (0) < d_min → clamp to 0
+        else:
+            # All windows identical — flat distance matrix
+            D_norm = torch.zeros_like(dist)
+        return D_norm
+
+    def _soft_assignments(self, D_norm: torch.Tensor) -> torch.Tensor:
+        """
+        Computes soft assignment matrix w_I from min-max normalized distance.
+
+        w_I(i,i') = α * σ(-(D_norm(i,i') - 1) / τ_I)   for i ≠ i'
+        w_I(i,i) = 1   (self/positive pair, set to 1 to match pos weight)
+
+        Returns:
+            w: (N, N) soft assignment matrix
+        """
+        N = D_norm.shape[0]
+        # Off-diagonal assignments
+        w = self.alpha * torch.sigmoid(-(D_norm - 1.0) / self.tau_I)
+        # Set diagonal to 1 (self-pair / positive weight)
+        eye = torch.eye(N, dtype=torch.bool, device=D_norm.device)
+        w = w.masked_fill(eye, 1.0)
+        return w
+
+    def forward(
+        self,
+        z_i: torch.Tensor,
+        z_j: torch.Tensor,
+        x_raw: torch.Tensor,
+        sub_ids: torch.Tensor = None,    # unused — accepted for API consistency
+        time_idx: torch.Tensor = None,   # unused — accepted for API consistency
+        is_boundary: torch.Tensor = None  # unused
+    ) -> torch.Tensor:
+        """
+        Compute soft instance-wise contrastive loss.
+
+        Args:
+            z_i: (N, D) projected embeddings, augmented view 1 (L2 normalized by caller)
+            z_j: (N, D) projected embeddings, augmented view 2 (L2 normalized by caller)
+            x_raw: (N, C, T) raw EEG windows used to compute inter-instance distances
+            sub_ids: ignored (API compatibility)
+            time_idx: ignored (API compatibility)
+            is_boundary: ignored (API compatibility)
+
+        Returns:
+            loss: scalar soft contrastive loss
+        """
+        N = z_i.shape[0]
+        if N < 2:
+            return z_i.new_tensor(0.0)
+
+        # ── 1. Compute soft assignment matrix from raw EEG windows ────────────
+        # Shape: (N, N)  D_norm in [0, 1]
+        D_norm = self._pairwise_euclidean_minmax(x_raw)
+        w_I = self._soft_assignments(D_norm)  # (N, N)
+
+        # ── 2. L2 normalize projections ───────────────────────────────────────
+        z_i_n = F.normalize(z_i, dim=1)
+        z_j_n = F.normalize(z_j, dim=1)
+
+        # ── 3. Concatenate: z = [z_i; z_j], shape (2N, D) ───────────────────
+        z = torch.cat([z_i_n, z_j_n], dim=0)  # (2N, D)
+
+        # ── 4. Similarity matrix s = z @ z.T / τ, shape (2N, 2N) ─────────────
+        sim = torch.mm(z, z.t()) / self.temperature  # (2N, 2N)
+
+        # ── 5. Build soft assignment matrix for the 2N expanded batch ─────────
+        # w_expanded[i, j] for i, j in {0..2N-1}:
+        # The positive of z_i[k] (index k) is z_j[k] (index N+k), and vice versa.
+        # For non-positive pairs, weight from D_norm.
+        #
+        # Block structure (2N x 2N):
+        #   [w_I    | w_I  ]   where diag entries of top-left and bottom-right
+        #   [w_I    | w_I  ]   are self pairs (distance=0, w→0.5*α from formula;
+        #                       BUT the self entries [k,k] are set to 1 in _soft_assignments)
+        #
+        # We build all four blocks from w_I (which is N×N).
+        # Then override:
+        #   - The positive positions [k, N+k] and [N+k, k] → w = 1 (positive)
+        #   - Self positions [k, k] and [N+k, N+k] → will be masked to -inf
+
+        w_exp = torch.cat([
+            torch.cat([w_I, w_I], dim=1),
+            torch.cat([w_I, w_I], dim=1),
+        ], dim=0)  # (2N, 2N)
+
+        # Positive positions: z_i[k] ↔ z_j[k]  i.e. [k, N+k] and [N+k, k]
+        eye_N = torch.eye(N, dtype=torch.bool, device=z_i.device)
+        pos_mask = torch.zeros(2*N, 2*N, dtype=torch.bool, device=z_i.device)
+        pos_mask[:N, N:] = eye_N
+        pos_mask[N:, :N] = eye_N
+        w_exp = w_exp.masked_fill(pos_mask, 1.0)
+
+        # Self-pair positions: [k, k] for k in 0..2N-1
+        self_mask = torch.eye(2*N, dtype=torch.bool, device=z_i.device)
+
+        # ── 6. Log-softmax over all j ≠ self ─────────────────────────────────
+        # Mask self to -inf so they don't contribute
+        sim_masked = sim.masked_fill(self_mask, float('-inf'))
+        log_p = F.log_softmax(sim_masked, dim=1)  # (2N, 2N)
+
+        # ── 7. Compute soft loss per anchor ───────────────────────────────────
+        # ℓ(i) = -log p(pos(i)) - Σ_{j≠i, j≠pos(i)} w_I(i,j) * log p(j)
+        # Which equals: -Σ_{j≠self} w_full(i,j) * log p(j)
+        # where w_full(pos) = 1, w_full(other) = w_I(i,j), w_full(self) = 0
+
+        # Zero out self column weights
+        w_exp = w_exp.masked_fill(self_mask, 0.0)
+
+        # Weighted sum of log_p
+        # loss_per_anchor = -sum_j w_exp[i,j] * log_p[i,j]
+        # Note: where w_exp=0 and log_p=-inf, product is 0 * (-inf) = nan.
+        # Since w=0 means zero contribution, we replace such nans with 0.
+        loss_matrix = -(w_exp * log_p).nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)  # (2N, 2N)
+
+        # Normalize each row by the sum of weights (excluding self)
+        # This follows the reference code: loss = sum(logits * soft_labels) / (2*B*T)
+        # In their notation, the denominator is constant (2*B) not per-row.
+        # We use the same convention: divide total by 2N.
+        loss = loss_matrix.sum() / (2 * N)
+
+        return loss
